@@ -27,6 +27,7 @@
 <details>
 <summary><b>目录</b></summary>
 
+- [演示视频](#演示视频)
 - [30 秒读懂](#30-秒读懂)
 - [核心能力](#核心能力)
 - [快速开始](#快速开始)
@@ -39,6 +40,20 @@
 - [打包 macOS App](#打包-macos-app)
 
 </details>
+
+## 演示视频
+
+<p align="center">
+  <a href="https://github.com/zhj-ldm/Star-Trek-voice-computer-rust/raw/mac-edition/docs/demo.mp4">
+    <img src="docs/demo-poster.jpg" alt="演示视频：语音唤醒、子代理整理待办、网易云音乐播放深空九号主题曲、查询天气">
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/zhj-ldm/Star-Trek-voice-computer-rust/raw/mac-edition/docs/demo.mp4"><b>▶ 点击封面观看完整演示</b></a>
+  <br>
+  80 秒 · 有声 · 约 2.4 MB
+</p>
 
 ## 30 秒读懂
 
