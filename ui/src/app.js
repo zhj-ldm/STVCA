@@ -145,6 +145,46 @@ async function withBusy(btn, busyText, fn) {
   }
 }
 
+// ---------------- 列表加载 / 错误态（消灭静默吞错：失败必须可见 + 可重试） ----------------
+function renderListLoading(box) {
+  if (!box) return;
+  box.innerHTML = '<div class="list-empty list-loading" data-i18n>加载中…<span class="db-dots"><i></i><i></i><i></i></span></div>';
+}
+// 失败态：可见错误文案 + 「重试」按钮（复用空状态样式，LCARS 下同样生效）
+function renderListError(box, message, retryFn, emptyClass = 'list-empty') {
+  if (!box) return;
+  box.innerHTML = '';
+  const div = document.createElement('div');
+  div.className = emptyClass + ' list-error';
+  const tx = document.createElement('div');
+  tx.textContent = '加载失败：' + (message || '后端未连接');
+  div.appendChild(tx);
+  if (retryFn) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-mini list-retry';
+    btn.textContent = '重试';
+    btn.addEventListener('click', () => withBusy(btn, '加载中…', retryFn));
+    div.appendChild(btn);
+  }
+  box.appendChild(div);
+}
+
+// ---------------- 会话代际号（竞态守卫） ----------------
+// 每次切换/新建/接管会话时自增；在途请求回来后校验代际号，过期响应直接丢弃，
+// 根治「旧会话的慢响应覆盖新会话内容」。配合 AbortController 取消在途消息请求。
+let sessionEpoch = 0;
+let messagesAbort = null;
+function bumpSessionEpoch() {
+  sessionEpoch += 1;
+  if (messagesAbort) { messagesAbort.abort(); messagesAbort = null; }
+  return sessionEpoch;
+}
+// 用户最近一次主动切换/新建会话的时间：此窗口内 SSE 不强行把界面拽回其它会话
+let lastUserSwitchAt = 0;
+const USER_SWITCH_GRACE_MS = 10000;
+let adoptHintAt = 0;
+
 // 当前会话 id（切换会话时更新；null = 跟随后端 active）
 let currentSessionId = null;
 // 由 sendText 乐观渲染、尚未被 SSE user_text 消费的用户文本队列
@@ -332,13 +372,17 @@ async function deleteSubagentTask(t) {
 }
 
 async function loadSubagents() {
+  const list = document.getElementById('subagent-list');
+  // 首次/空列表时给轻量 loading；已有内容时静默刷新，避免闪烁
+  if (list && !list.querySelector('.sa-item')) renderListLoading(list);
   try {
     const j = await apiGet('/api/subagents');
     subagentTasks = (j && j.tasks) || [];
     renderSubagents();
     renderSubagentBadge();
   } catch (e) {
-    /* 后端未就绪时静默，避免启动瞬间弹错 */
+    // 不再静默吞错：渲染可见错误态 + 重试（不弹 toast，避免启动瞬间打扰）
+    renderListError(list, e.message, loadSubagents, 'sa-empty');
   }
 }
 
@@ -537,6 +581,7 @@ function evForCurrentSession(ev) {
 // 清空当前视图后直接接收后续流式事件，保证"说的和看到的"在同一个会话里。
 function adoptSession(sid) {
   if (!sid || sid === currentSessionId) return;
+  bumpSessionEpoch(); // 取消在途消息请求，防止旧会话历史覆盖接管后的流式内容
   currentSessionId = sid;
   turnSessionId = sid;
   currentTurn = null;
@@ -627,11 +672,28 @@ function snapFor(sessionId) {
 function cacheTurnReset(sessionId) {
   turnSnapshots.set(sessionId, { text: '', tools: new Map(), reasoning: [], done: false, elapsedMs: 0 });
 }
-function cacheTurnText(sessionId, t) { snapFor(sessionId).text = t; }
-function cacheTurnReasoning(sessionId, t) { snapFor(sessionId).reasoning.push(t); }
+// 上一轮已 done 后又来了新一轮事件（如子 Agent 汇报轮没有 user_text 重置）：
+// 先清空快照，避免把上一轮的文本/工具带进新轮。
+function freshSnap(sessionId) {
+  const s = snapFor(sessionId);
+  if (s.done) {
+    s.text = '';
+    s.tools = new Map();
+    s.reasoning = [];
+    s.done = false;
+    s.elapsedMs = 0;
+  }
+  return s;
+}
+// assistant_text 是流式 token 片段，必须累加；覆盖式赋值会让快照只剩最后几个字，
+// 切回会话时被当成"历史缺失"补渲染成一条假消息。
+function cacheTurnText(sessionId, t) { freshSnap(sessionId).text += t; }
+// 整段文本写入（错误提示等非流式内容）。
+function cacheTurnSetText(sessionId, t) { freshSnap(sessionId).text = t; }
+function cacheTurnReasoning(sessionId, t) { freshSnap(sessionId).reasoning.push(t); }
 // 工具快照按 call_id 精确建卡：同名工具并发/连续调用不再互相覆盖
 function cacheTurnToolUse(sessionId, id, name, input) {
-  const tools = snapFor(sessionId).tools;
+  const tools = freshSnap(sessionId).tools;
   const key = id || name;
   if (id || !tools.has(key)) {
     tools.set(key, { id: id || '', name, inputs: [input], ok: null, summary: '', dur: '', startTs: Date.now() });
@@ -642,7 +704,7 @@ function cacheTurnToolUse(sessionId, id, name, input) {
   }
 }
 function cacheTurnToolResult(sessionId, id, name, ok, summary) {
-  const tools = snapFor(sessionId).tools;
+  const tools = freshSnap(sessionId).tools;
   let e = id ? tools.get(id) : null;
   if (!e) {
     // 无 id（旧后端兼容）：按名字找最近一个未完成的同名调用
@@ -656,7 +718,14 @@ function cacheTurnToolResult(sessionId, id, name, ok, summary) {
     if (e.startTs) e.dur = ((Date.now() - e.startTs) / 1000).toFixed(1) + 's';
   }
 }
-function cacheTurnDone(sessionId, elapsedMs) { const s = snapFor(sessionId); s.done = true; if (elapsedMs) s.elapsedMs = elapsedMs; }
+function cacheTurnDone(sessionId, elapsedMs, finalText) {
+  const s = snapFor(sessionId);
+  s.done = true;
+  if (elapsedMs) s.elapsedMs = elapsedMs;
+  // 以 done 携带的完整最终文本为准（流式片段可能丢失/顺序异常），
+  // 保证切回会话时能与会话历史精确比对，不会补渲染残留片段。
+  if (typeof finalText === 'string') s.text = finalText;
+}
 
 function setSendBtn(busy) {
   sendBusy = !!busy;
@@ -687,6 +756,7 @@ async function pollStatus() {
     banner.hidden = true;
     banner.textContent = '后端未连接 · 正在重连…';
     renderVoiceDiag(s);
+    window.voiceEnabled = !!s.voice_enabled;
     syncMicDot(s); // 顶栏"语音"胶囊以后端为权威，避免与真实监听状态脱节
     syncContinuousBtn(s); // 多轮对话按钮：仅监听开启时出现，状态以后端为权威
     mainBusy = s.main_status === 'working';
@@ -788,34 +858,61 @@ async function listeningWithRetry(enabled, payload, tries = 6) {
   return false;
 }
 
+// 麦克风开关 busy 守卫：开启/关闭期间禁用按钮，防连点并行跑两套流程；
+// 结束后以 /api/status 轮询结果为权威同步按钮/指示灯状态。
+let micToggling = false;
 $('#btn-mic').addEventListener('click', async () => {
-  if (!micOn) {
-    // ①授权麦克风 + 复用/重建后端采集（失败则中止，不会虚报监听）
-    await mic.start();
-    if (mic.getState() === 'err') return;
-    // ②开启后端监听（带重试）
-    const ok = await listeningWithRetry(true, { enabled: true, session_id: currentSessionId });
-    if (!ok) {
-      mic.stop();
-      setMicBtn('mic-err', '监听开启失败（语音服务不可用）');
-      setMicState('off', '监听开启失败');
-      return;
-    }
-    micOn = true;
-    setMicState('on', '监听中：等待唤醒词');
-    setMicBtn('mic-standby', '监听中（绿色）· 点击关闭');
-  } else {
-    const ok = await listeningWithRetry(false, { enabled: false });
-    mic.stop();
-    micOn = false;
-    // 关闭以后端执行为准：关闭失败说明后端仍在监听，按钮保持绿色
-    if (ok) {
-      setMicBtn('mic-off', '开启语音监听');
-      setMicState('off', '监听已停止');
+  if (micToggling) return;
+  micToggling = true;
+  const micBtn = $('#btn-mic');
+  const prevTitle = micBtn.title;
+  micBtn.disabled = true;
+  micBtn.classList.add('is-busy');
+  micBtn.title = micOn ? '关闭中…' : '开启中…';
+  micBtn.setAttribute('aria-label', micBtn.title);
+  try {
+    if (!micOn) {
+      // ①授权麦克风 + 复用/重建后端采集（失败则中止，不会虚报监听）
+      await mic.start();
+      if (mic.getState() === 'err') {
+        toast('麦克风不可用', 'error');
+        return;
+      }
+      // ②开启后端监听（带重试）
+      const ok = await listeningWithRetry(true, { enabled: true, session_id: currentSessionId });
+      if (!ok) {
+        mic.stop();
+        setMicBtn('mic-err', '监听开启失败（语音服务不可用）');
+        setMicState('off', '监听开启失败');
+        toast('监听开启失败（语音服务不可用）', 'error');
+        return;
+      }
+      micOn = true;
+      setMicState('on', '监听中：等待唤醒词');
+      setMicBtn('mic-standby', '监听中（绿色）· 点击关闭');
     } else {
-      setMicBtn('mic-standby', '关闭失败，后端仍在监听（绿色）');
-      setMicState('on', '后端仍在监听');
+      const ok = await listeningWithRetry(false, { enabled: false });
+      mic.stop();
+      micOn = false;
+      // 关闭以后端执行为准：关闭失败说明后端仍在监听，按钮保持绿色
+      if (ok) {
+        setMicBtn('mic-off', '开启语音监听');
+        setMicState('off', '监听已停止');
+      } else {
+        setMicBtn('mic-standby', '关闭失败，后端仍在监听（绿色）');
+        setMicState('on', '后端仍在监听');
+        toast('关闭失败，后端仍在监听（绿色）', 'error');
+      }
     }
+  } finally {
+    micToggling = false;
+    micBtn.disabled = false;
+    micBtn.classList.remove('is-busy');
+    if (micBtn.title === '开启中…' || micBtn.title === '关闭中…') {
+      micBtn.title = prevTitle;
+      micBtn.setAttribute('aria-label', prevTitle);
+    }
+    pollStatus(); // 后端权威状态立即同步（按钮颜色/多轮按钮/指示灯）
   }
 });
 
@@ -866,13 +963,17 @@ mic.on('mic_error', ({ message }) => {
 const sessionList = $('#session-list');
 
 async function loadSessions() {
+  const epoch = sessionEpoch; // 代际号：期间用户切换/新建会话则本次响应作废
   try {
     const j = await apiGet('/api/sessions');
+    if (epoch !== sessionEpoch) return;
     const activeId = j.active;
     const list = j.sessions || [];
     if (list.length === 0) {
       // 无任何会话则新建一个
       const n = await apiPost('/api/sessions', {});
+      if (epoch !== sessionEpoch) return;
+      bumpSessionEpoch();
       currentSessionId = n.id;
       renderSessionList([n], n.id);
       renderChat([]);
@@ -891,8 +992,19 @@ async function loadSessions() {
     // 等消息渲染完成再返回：调用方（switchSession 等）不会出现「历史稍后才覆盖 UI」的竞态
     await loadMessages(currentSessionId);
     syncVoiceSession();
-  } catch {
-    sessionList.innerHTML = '<div class="session-empty">会话服务不可用</div>';
+  } catch (e) {
+    if (epoch !== sessionEpoch || (e && e.name === 'AbortError')) return;
+    sessionList.innerHTML = '';
+    const div = document.createElement('div');
+    div.className = 'session-empty';
+    div.textContent = '会话服务不可用';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-mini list-retry';
+    btn.textContent = '重试';
+    btn.addEventListener('click', () => withBusy(btn, '加载中…', loadSessions));
+    sessionList.appendChild(div);
+    sessionList.appendChild(btn);
   }
 }
 
@@ -990,7 +1102,7 @@ async function deleteSession(id) {
     const j = await apiDelete(`/api/sessions/${encodeURIComponent(id)}`);
     if (j && j.ok === false) throw new Error(j.error || '后端未确认删除');
     turnSnapshots.delete(id);
-    if (currentSessionId === id) currentSessionId = null;
+    if (currentSessionId === id) { bumpSessionEpoch(); currentSessionId = null; }
     toast('对话已删除', 'success');
     await loadSessions();
   } catch (e) { toast('删除失败: ' + e.message, 'error'); }
@@ -1024,6 +1136,7 @@ function syncVoiceSession() {
 }
 
 async function switchSession(id) {
+  if (id === currentSessionId) return;
   try {
     // 后端确认后才更新前端状态：切换失败（如会话不存在/后端异常）
     // 必须保留原会话并明确提示，避免前端显示与后端 active 脱节。
@@ -1032,6 +1145,8 @@ async function switchSession(id) {
       addSystem((j && j.error) || '切换会话失败：后端未确认（会话可能已被删除）');
       return;
     }
+    bumpSessionEpoch(); // 立即取消旧会话在途消息请求，过期响应一律丢弃
+    lastUserSwitchAt = Date.now();
     currentSessionId = id;
     pendingLocalQueue.length = 0;
     // loadSessions 会按后端 active 加载一次消息，这里不再重复拉取
@@ -1049,6 +1164,8 @@ async function switchSession(id) {
 async function newSession() {
   try {
     await apiPost('/api/sessions', {});
+    bumpSessionEpoch();
+    lastUserSwitchAt = Date.now();
     currentSessionId = null; // 强制 loadSessions 取后端 active（新建会话）
     pendingLocalQueue.length = 0;
     await loadSessions();
@@ -1062,13 +1179,21 @@ async function newSession() {
 }
 
 async function loadMessages(id) {
+  const epoch = bumpSessionEpoch(); // 新请求即新代际：取消并作废所有在途旧请求
+  const ctrl = new AbortController();
+  messagesAbort = ctrl;
   try {
-    const j = await apiGet(`/api/sessions/${id}/messages`);
+    const j = await apiGet(`/api/sessions/${id}/messages`, { signal: ctrl.signal });
+    // 代际号 / 会话 id 双重校验：切走后回来的旧响应直接丢弃，不覆盖新会话
+    if (epoch !== sessionEpoch || id !== currentSessionId) return;
     if (!j || !j.ok) throw new Error((j && j.error) || '消息加载失败');
     renderChat(j.messages || []);
   } catch (e) {
+    if (ctrl.signal.aborted || epoch !== sessionEpoch || (e && e.name === 'AbortError')) return;
     // 加载失败时给出可见反馈，而不是残留上一个会话的内容造成误导
     renderChat(null, '会话消息加载失败：' + e.message);
+  } finally {
+    if (messagesAbort === ctrl) messagesAbort = null;
   }
 }
 
@@ -1198,6 +1323,7 @@ function renderChat(msgs, errText) {
   chat.scrollTop = chat.scrollHeight;
   chatPinned = true;
   chatLastTop = chat.scrollTop;
+  if (typeof refreshSquircles === 'function') refreshSquircles();
 }
 
 // ════════ AI 执行流节点（thought / action / observation / answer / report） ════════
@@ -1489,12 +1615,31 @@ function makeToolNode(title, inputHtml) {
 }
 
 // 复制纯文本（工具结果 / 最终回答共用的轻量动作）
+// 只有真正写入剪贴板成功才显示「已复制」；失败降级 execCommand，再失败明确报错。
 function copyPlain(text, btn) {
   if (!text) return;
-  if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
-  const old = btn.textContent;
-  btn.textContent = '已复制';
-  setTimeout(() => { btn.textContent = old; }, 1400);
+  const done = () => {
+    const old = btn.textContent;
+    btn.textContent = '已复制';
+    setTimeout(() => { btn.textContent = old; }, 1400);
+  };
+  const fail = () => toast('复制失败，请手动选择文本复制', 'error');
+  const fallback = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      if (ok) done(); else fail();
+    } catch { fail(); }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done).catch(fallback);
+  } else fallback();
 }
 
 // 失败节点的重试入口：当前后端没有工具级重试接口，重发上一轮用户指令是唯一真实能力
@@ -1767,10 +1912,12 @@ function beginTurnUI() {
   return turn;
 }
 
-// 请求被后端拒绝/发送失败：撤掉刚建好的空助手块，避免留下一直走秒的思考卡
+// 请求被后端拒绝/发送失败：撤掉刚建好的空助手块，避免留下一直走秒的思考卡。
+// 只移除仍挂在文档里的块：会话已切换/重建时 currentTurn 属于新会话，不得误删。
 function abortTurnUI() {
   hideProcessing();
   if (currentTurn) {
+    if (currentTurn.msg && !currentTurn.msg.isConnected) { currentTurn = null; return; }
     if (currentTurn.thought) currentTurn.thought.stop();
     if (currentTurn.msg) currentTurn.msg.remove();
     currentTurn = null;
@@ -1803,6 +1950,8 @@ function finalizeTurn(turn, elapsedMs) {
   }
   turn.done = true;
   renderDeliver(turn);
+  // 流式期间 squircle observer 忽略聊天区；收尾时补一次圆角重算
+  if (typeof refreshSquircles === 'function') refreshSquircles();
 }
 
 function renderDeliver(turn) {
@@ -2428,29 +2577,33 @@ function sendText(text) {
   lastTurnUserText = text;
   beginTurnUI();
   pendingLocalQueue.push(text);
-  turnSessionId = currentSessionId;
-  cacheTurnReset(currentSessionId);
+  const sentSession = currentSessionId; // 发送时所属会话：失败回执只作用于该会话
+  turnSessionId = sentSession;
+  cacheTurnReset(sentSession);
   setSendBtn(true);
-  apiPost('/api/chat', { text, session_id: currentSessionId })
-    .then((j) => {
-      if (j && j.ok === false) {
-        abortTurnUI();
-        const qi = pendingLocalQueue.lastIndexOf(text);
-        if (qi >= 0) pendingLocalQueue.splice(qi, 1);
-        addSystem(j.error || '发送失败');
-        // 后端拒绝：本轮未真正占用任务，立即复位按钮（轮询会按 main_status 兜底纠正）
-        setSendBtn(false);
-        turnSessionId = null;
-      }
-    })
-    .catch((e) => {
+  // 失败收尾：用户已切走会话时，不得删掉新会话的 currentTurn / 复位新会话按钮
+  const failTurn = (msg) => {
+    const qi = pendingLocalQueue.lastIndexOf(text);
+    if (qi >= 0) pendingLocalQueue.splice(qi, 1);
+    if (sentSession === currentSessionId) {
       abortTurnUI();
-      const qi = pendingLocalQueue.lastIndexOf(text);
-      if (qi >= 0) pendingLocalQueue.splice(qi, 1);
-      addSystem('发送失败: ' + e.message);
+      addSystem(msg);
       setSendBtn(false);
       turnSessionId = null;
-    });
+    } else {
+      // 旧会话的失败：只清理旧会话的忙碌标记，用 toast 提示，不碰当前视图
+      if (turnSessionId === sentSession) turnSessionId = null;
+      toast(msg, 'error');
+    }
+  };
+  apiPost('/api/chat', { text, session_id: sentSession })
+    .then((j) => {
+      if (j && j.ok === false) {
+        // 后端拒绝：本轮未真正占用任务，立即复位按钮（轮询会按 main_status 兜底纠正）
+        failTurn(j.error || '发送失败');
+      }
+    })
+    .catch((e) => failTurn('发送失败: ' + e.message));
 }
 
 // 打断当前正在进行的 AI 回复（点击暂停按钮）
@@ -2511,13 +2664,33 @@ $('#chat-input').addEventListener('keydown', (e) => {
 });
 $('#chat-input').addEventListener('input', () => setSendBtn(sendBusy));
 
-// Esc = 打断当前会话正在进行的回复（弹窗打开时由弹窗自己处理 Esc）
+// Esc = 打断当前会话正在进行的回复。按层互斥：弹窗 > 子 Agent 详情 > 主对话，
+// 弹窗/详情打开时 Esc 只关它们自己，绝不打断主对话的在途回复。
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape' || modalOpen) return;
+  const saBox = document.getElementById('sa-detail');
+  if (saBox && !saBox.hidden) return; // 详情层自己处理 Esc（见下方监听）
   if (sendBusy && turnSessionId === currentSessionId) interruptAI();
 });
 
 // ---------------- SSE 事件 ----------------
+// 流式渲染节流：token 只累积进缓冲，requestAnimationFrame 每帧最多全量渲染一次，
+// 长回复不再每个 token 都 renderMd + innerHTML 导致掉帧。按 turn 独立调度，
+// 会话切换/收尾（done/interrupted/failed）后自动作废，不会覆盖最终状态。
+function scheduleStreamFlush(turn) {
+  turn._streamDirty = true;
+  if (turn._flushScheduled) return;
+  turn._flushScheduled = true;
+  requestAnimationFrame(() => {
+    turn._flushScheduled = false;
+    if (!turn._streamDirty || turn.done || turn.interrupted || turn.failed) return;
+    turn._streamDirty = false;
+    if (!turn.msg || !turn.msg.isConnected) return; // 已切走：快照兜底，不再渲染
+    turn.text.innerHTML = renderMd(turn._streamBuf || '');
+    scrollChat();
+  });
+}
+
 // 事件序号去重：后端重放（重连/Lagged 补齐）可能与实时流重叠，按 id 丢弃已处理事件
 let lastEventId = 0;
 let esHadError = false;
@@ -2562,8 +2735,17 @@ function handleEvent(ev) {
   )) return;
   // 语音唤醒/定时任务等外部输入可能落在别的会话：界面立即切过去，
   // 否则会出现"AI 有语音反馈但界面完全没有消息、会话里也找不到"的情况。
+  // 但用户刚主动切换/新建会话（10s 窗口内）时不强行拽回，只给一次轻提示。
   if (ev.type === 'user_text' && ev.session_id && currentSessionId && ev.session_id !== currentSessionId) {
-    adoptSession(ev.session_id);
+    if (Date.now() - lastUserSwitchAt < USER_SWITCH_GRACE_MS) {
+      const nowTs = Date.now();
+      if (nowTs - adoptHintAt > USER_SWITCH_GRACE_MS) {
+        adoptHintAt = nowTs;
+        toast('有新输入进入了其他会话，可在侧栏点击查看', 'info');
+      }
+    } else {
+      adoptSession(ev.session_id);
+    }
   }
   switch (ev.type) {
     case 'user_text':
@@ -2575,7 +2757,9 @@ function handleEvent(ev) {
         cacheTurnReset(ev.session_id || currentSessionId);
         break;
       }
-      finishTurn(); // 新轮开始：先清理上一轮 DOM 状态（无论是否当前会话）
+      // 新轮开始：先清理上一轮 DOM 状态。仅当新轮属于当前查看的会话时才动视图，
+      // 否则（用户刚切走、外部输入落在其它会话）不得提前收尾当前会话的在途回复。
+      if (evForCurrentSession(ev)) finishTurn();
       cacheTurnReset(ev.session_id || currentSessionId);
       if (!evForCurrentSession(ev)) break;
       // 语音路径（非打字来源）双发防护：同一文本 5 秒内重复到达视为重放，丢弃
@@ -2601,7 +2785,8 @@ function handleEvent(ev) {
       textTurn.answerNode.hidden = false;
       if (textTurn._streamBuf == null) textTurn._streamBuf = '';
       textTurn._streamBuf += ev.text;
-      textTurn.text.innerHTML = renderMd(textTurn._streamBuf);
+      // 每帧最多渲染一次（rAF 批量 flush），token 高频到达也不卡
+      scheduleStreamFlush(textTurn);
       tlSetState(textTurn.answerNode, 'running');
       // 开始输出最终回答 = 思考阶段结束，思考块自动收起为一行摘要，小窗同时收起
       if (textTurn.thought) textTurn.thought.finish();
@@ -2609,7 +2794,6 @@ function handleEvent(ev) {
       if (!textTurn.toolCount && (!textTurn.thought || textTurn.thought.node.hidden)) {
         textTurn.tl.classList.add('is-plain');
       }
-      scrollChat();
       break;
     }
     case 'assistant_done':
@@ -2618,10 +2802,15 @@ function handleEvent(ev) {
       setSendBtn(false);
       turnSessionId = null;
       clearInterruptWait();
-      cacheTurnDone(ev.session_id || currentSessionId, ev.elapsed_ms); // 标记快照完成 + 留存本轮耗时
+      cacheTurnDone(ev.session_id || currentSessionId, ev.elapsed_ms, ev.text); // 标记快照完成 + 回填完整文本
       if (!evForCurrentSession(ev)) break;
       hideProcessing();
       if (currentTurn) {
+        // 收尾前同步 flush 尚未落屏的流式缓冲（rAF 可能还没跑到），避免最后一段丢字
+        if (currentTurn._streamDirty && currentTurn._streamBuf && !ev.interrupted && !currentTurn.failed) {
+          currentTurn._streamDirty = false;
+          currentTurn.text.innerHTML = renderMd(currentTurn._streamBuf);
+        }
         // 工具调用后由 tool_use 创建的 currentTurn 回答节点为空，回填最终文本；
         // 若已由 assistant_text 覆盖过则保持不动
         if (ev.interrupted) {
@@ -2676,7 +2865,7 @@ function handleEvent(ev) {
       break;
     case 'turn_failed': {
       toast('本轮请求失败：' + ev.message, 'error', 6000);
-      cacheTurnText(ev.session_id || currentSessionId, '[错误] ' + ev.message);
+      cacheTurnSetText(ev.session_id || currentSessionId, '[错误] ' + ev.message);
       if (!evForCurrentSession(ev)) break;
       hideProcessing();
       const ft = ensureTurn();
@@ -2689,13 +2878,16 @@ function handleEvent(ev) {
       const msg = document.createElement('div');
       msg.className = 'tl-turn-error__msg';
       msg.textContent = '请求失败：' + ev.message;
-      const retry = document.createElement('button');
-      retry.type = 'button';
-      retry.className = 'tl-action';
-      retry.textContent = '重试本轮';
-      retry.addEventListener('click', () => retryLastTurn());
       box.appendChild(msg);
-      box.appendChild(retry);
+      // retryable=false（配置类错误）重试也不会成功，不给重试入口
+      if (ev.retryable !== false) {
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'tl-action';
+        retry.textContent = '重试本轮';
+        retry.addEventListener('click', () => retryLastTurn());
+        box.appendChild(retry);
+      }
       ft.text.appendChild(box);
       tlSetState(ft.answerNode, 'failed');
       scrollChat();
@@ -2947,10 +3139,11 @@ async function pollVoiceLevel() {
 async function loadMemory() {
   // 编辑保护：用户正在改某条记忆时不重建列表（避免输入到一半被 SSE 刷新冲掉）
   if (document.querySelector('#memory-list .mem-edit-title')) return;
+  const box = $('#memory-list');
+  if (box && !box.querySelector('.list-item')) renderListLoading(box);
   try {
     const list = await apiGet('/api/memory');
     $('#memory-count').textContent = list.length;
-    const box = $('#memory-list');
     box.innerHTML = '';
     if (!list.length) {
       box.innerHTML = '<div class="list-empty">暂无记忆条目。在左侧新增，或让 AI 在对话中自动沉淀。</div>';
@@ -3012,7 +3205,10 @@ async function loadMemory() {
       view();
       box.appendChild(item);
     });
-  } catch (e) { $('#memory-count').textContent = '错误'; }
+  } catch (e) {
+    $('#memory-count').textContent = '—';
+    renderListError(box, e.message, loadMemory);
+  }
 }
 
 $('#memory-form').addEventListener('submit', async (e) => {
@@ -3045,10 +3241,11 @@ $('#btn-memory-clear').addEventListener('click', async () => {
 
 // ---------------- Skills ----------------
 async function loadSkills() {
+  const box = $('#skill-list');
+  if (box && !box.querySelector('.list-item')) renderListLoading(box);
   try {
     const list = await apiGet('/api/skills');
     $('#skill-count').textContent = list.length;
-    const box = $('#skill-list');
     box.innerHTML = '';
     if (!list.length) {
       box.innerHTML = '<div class="list-empty">暂无 Skill。在右侧选择文件夹导入，或让 AI 用 ImportSkill 工具自行导入。</div>';
@@ -3076,14 +3273,25 @@ async function loadSkills() {
     });
     box.querySelectorAll('[data-toggle]').forEach((b) => b.addEventListener('click', async () => {
       const enabled = b.dataset.enabled === '1';
+      // 乐观 UI：先本地翻转状态，失败回滚 + toast
+      const item = b.closest('.list-item');
+      const tag = item && item.querySelector('.tag');
+      const setUI = (en) => {
+        b.dataset.enabled = en ? '1' : '0';
+        b.textContent = en ? '停用' : '启用';
+        if (tag) { tag.textContent = en ? '启用' : '停用'; tag.className = 'tag ' + (en ? 'ok' : 'off'); }
+      };
+      setUI(!enabled);
       b.disabled = true;
       try {
         const j = await apiPost('/api/skills/' + encodeURIComponent(b.dataset.toggle) + '/toggle', { enabled: !enabled });
         if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+        toast(!enabled ? '已启用' : '已停用', 'success');
         loadSkills();
       } catch (e) {
-        toast('操作失败: ' + e.message, 'error');
+        setUI(enabled); // 回滚
         b.disabled = false;
+        toast('操作失败: ' + e.message, 'error');
       }
     }));
     box.querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', async () => {
@@ -3093,9 +3301,13 @@ async function loadSkills() {
         const j = await apiDelete('/api/skills/' + encodeURIComponent(b.dataset.remove));
         if (j && j.ok === false) throw new Error(j.error || '后端未确认');
         toast('已移除', 'success');
+        loadSkills();
       } catch (e) { toast('移除失败: ' + e.message, 'error'); }
     }));
-  } catch (e) { /* ignore */ }
+  } catch (e) {
+    $('#skill-count').textContent = '—';
+    renderListError(box, e.message, loadSkills);
+  }
 }
 
 // 原生「选择文件夹」：Electron 下打开系统对话框；浏览器调试时可手动输入路径兜底
@@ -3188,10 +3400,15 @@ function renderMcpServers(list) {
     box.appendChild(item);
   });
   box.querySelectorAll('[data-test]').forEach((b) => b.addEventListener('click', async () => {
-    b.disabled = true;
-    b.textContent = '连接中…';
-    try { await apiPost('/api/mcp/servers/' + encodeURIComponent(b.dataset.test) + '/test'); } catch (e) { /* 忽略，状态里会显示 */ }
-    loadMCP();
+    await withBusy(b, '连接中…', async () => {
+      try {
+        await apiPost('/api/mcp/servers/' + encodeURIComponent(b.dataset.test) + '/test');
+      } catch (e) {
+        // 不再静默：连接请求失败明确提示（服务状态区也会显示具体错误）
+        toast('连接失败: ' + e.message, 'error');
+      }
+      await loadMCP();
+    });
   }));
   box.querySelectorAll('[data-remove]').forEach((b) => b.addEventListener('click', async () => {
     const yes = await confirmDialog(`移除 MCP 服务「${b.dataset.remove}」？`, { title: '移除 MCP 服务', danger: true, confirmText: '移除' });
@@ -3207,12 +3424,12 @@ function renderMcpServers(list) {
 
 async function loadMCP() {
   const box = $('#mcp-list');
-  box.innerHTML = '<div class="mcp-empty">正在连接…</div>';
+  renderListLoading(box);
   try {
     const data = await apiGet('/api/mcp/servers');
     renderMcpServers(data.servers || []);
   } catch (e) {
-    box.innerHTML = `<div class="mcp-empty">加载失败：${esc(e.message)}</div>`;
+    renderListError(box, e.message, loadMCP, 'mcp-empty');
   }
 }
 
@@ -3299,10 +3516,11 @@ $('#sched-freq').addEventListener('change', syncSchedRow);
 syncSchedRow();
 
 async function loadSchedules() {
+  const box = $('#schedule-list');
+  if (box && !box.querySelector('.list-item')) renderListLoading(box);
   try {
     const list = await apiGet('/api/schedules');
     $('#schedule-count').textContent = list.length;
-    const box = $('#schedule-list');
     box.innerHTML = '';
     if (!list.length) {
       box.innerHTML = '<div class="list-empty">暂无定时任务。在左侧创建，到点后自动交给 AI 执行。</div>';
@@ -3326,14 +3544,25 @@ async function loadSchedules() {
     });
     box.querySelectorAll('[data-toggle]').forEach((b) => b.addEventListener('click', async () => {
       const enabled = b.dataset.enabled === '1';
+      // 乐观 UI：先本地翻转，失败回滚 + toast
+      const item = b.closest('.list-item');
+      const tag = item && item.querySelector('.tag');
+      const setUI = (en) => {
+        b.dataset.enabled = en ? '1' : '0';
+        b.textContent = en ? '停用' : '启用';
+        if (tag) { tag.textContent = en ? '启用' : '停用'; tag.className = 'tag ' + (en ? 'ok' : 'off'); }
+      };
+      setUI(!enabled);
       b.disabled = true;
       try {
         const j = await apiPost('/api/schedules/' + encodeURIComponent(b.dataset.toggle), { enabled: !enabled });
         if (j && j.ok === false) throw new Error(j.error || '后端未确认');
+        toast(!enabled ? '已启用' : '已停用', 'success');
         loadSchedules();
       } catch (e) {
-        toast('操作失败: ' + e.message, 'error');
+        setUI(enabled); // 回滚
         b.disabled = false;
+        toast('操作失败: ' + e.message, 'error');
       }
     }));
     box.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
@@ -3343,9 +3572,13 @@ async function loadSchedules() {
         const j = await apiDelete('/api/schedules/' + encodeURIComponent(b.dataset.del));
         if (j && j.ok === false) throw new Error(j.error || '后端未确认');
         toast('定时任务已删除', 'success');
+        loadSchedules();
       } catch (e) { toast('删除失败: ' + e.message, 'error'); }
     }));
-  } catch (e) { /* ignore */ }
+  } catch (e) {
+    $('#schedule-count').textContent = '—';
+    renderListError(box, e.message, loadSchedules);
+  }
 }
 
 $('#schedule-form').addEventListener('submit', async (e) => {
@@ -3369,6 +3602,155 @@ $('#schedule-form').addEventListener('submit', async (e) => {
 
 
 // ---------------- 设置 ----------------
+
+// ---- 主题化自定义下拉（替代原生 select：键盘可达、可搜索、LCARS 风格） ----
+// mountDropdown(host, { items:[{value,label,disabled?}], value, onChange, placeholder, searchable, up })
+// 返回控制器 { setItems, setValue, getValue, open, close }；host._dd 亦持有同一控制器。
+function mountDropdown(host, opts = {}) {
+  const searchable = !!opts.searchable;
+  let items = opts.items || [];
+  let value = opts.value ?? '';
+  let open = false;
+  host.classList.add('dd');
+  host.innerHTML = '';
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'dd-trigger';
+  trigger.setAttribute('aria-haspopup', 'listbox');
+  const labelSpan = document.createElement('span');
+  labelSpan.className = 'dd-label';
+  const caret = document.createElement('span');
+  caret.className = 'dd-caret';
+  caret.textContent = '▾';
+  trigger.append(labelSpan, caret);
+  const panel = document.createElement('div');
+  panel.className = 'dd-panel';
+  panel.hidden = true;
+  panel.setAttribute('role', 'listbox');
+  let searchInput = null;
+  if (searchable) {
+    searchInput = document.createElement('input');
+    searchInput.className = 'dd-search';
+    searchInput.type = 'text';
+    searchInput.placeholder = '搜索…';
+    panel.appendChild(searchInput);
+  }
+  const list = document.createElement('div');
+  list.className = 'dd-list';
+  panel.appendChild(list);
+  host.append(trigger, panel);
+
+  const current = () => items.find((i) => String(i.value) === String(value));
+  const paintTrigger = () => {
+    const it = current();
+    labelSpan.textContent = it ? it.label : (opts.placeholder || '请选择');
+    labelSpan.classList.toggle('dd-placeholder', !it);
+    trigger.title = it ? it.label : '';
+  };
+  const paintList = (filter = '') => {
+    list.innerHTML = '';
+    const f = filter.trim().toLowerCase();
+    const shown = items.filter((i) => !f || String(i.label).toLowerCase().includes(f));
+    if (!shown.length) {
+      const empty = document.createElement('div');
+      empty.className = 'dd-empty';
+      empty.textContent = '无匹配项';
+      list.appendChild(empty);
+      return;
+    }
+    shown.forEach((i) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'dd-item';
+      b.dataset.value = i.value;
+      b.setAttribute('role', 'option');
+      b.textContent = i.label;
+      if (i.disabled) b.disabled = true;
+      if (String(i.value) === String(value)) {
+        b.classList.add('selected');
+        b.setAttribute('aria-selected', 'true');
+      }
+      b.addEventListener('click', () => {
+        if (i.disabled) return;
+        value = i.value;
+        paintTrigger();
+        close();
+        trigger.focus();
+        if (opts.onChange) opts.onChange(i.value, i);
+      });
+      list.appendChild(b);
+    });
+  };
+  const openPanel = () => {
+    if (open) return;
+    open = true;
+    panel.hidden = false;
+    host.classList.add('open');
+    trigger.setAttribute('aria-expanded', 'true');
+    paintList(searchInput ? searchInput.value : '');
+    if (searchInput) { searchInput.value = ''; searchInput.focus(); }
+    else {
+      const sel = list.querySelector('.dd-item.selected') || list.querySelector('.dd-item:not(:disabled)');
+      if (sel) sel.focus();
+    }
+  };
+  const close = () => {
+    if (!open) return;
+    open = false;
+    panel.hidden = true;
+    host.classList.remove('open');
+    trigger.setAttribute('aria-expanded', 'false');
+  };
+  trigger.addEventListener('click', () => (open ? close() : openPanel()));
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      openPanel();
+    }
+  });
+  panel.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      close();
+      trigger.focus();
+      return;
+    }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const btns = [...list.querySelectorAll('.dd-item:not(:disabled)')];
+      if (!btns.length) return;
+      const idx = btns.indexOf(document.activeElement);
+      const next = e.key === 'ArrowDown'
+        ? btns[(idx + 1) % btns.length]
+        : btns[(idx - 1 + btns.length) % btns.length];
+      next.focus();
+    }
+  });
+  if (searchInput) searchInput.addEventListener('input', () => paintList(searchInput.value));
+  paintTrigger();
+  const ctl = {
+    setItems(next, keepValue = true) {
+      items = next || [];
+      if (!keepValue) value = '';
+      paintTrigger();
+      if (open) paintList(searchInput ? searchInput.value : '');
+    },
+    setValue(v) { value = v ?? ''; paintTrigger(); if (open) paintList(searchInput ? searchInput.value : ''); },
+    getValue() { return value; },
+    open: openPanel,
+    close,
+  };
+  host._dd = ctl;
+  return ctl;
+}
+
+// 全局：点击下拉外部即收起；Esc 优先收起下拉（不冒泡到面板层）
+document.addEventListener('click', (e) => {
+  document.querySelectorAll('.dd.open').forEach((dd) => {
+    if (!dd.contains(e.target)) dd._dd && dd._dd.close();
+  });
+});
+
 function keyRowHTML(k, idx) {
   return (
     '<div class="key-row">' +
@@ -3390,6 +3772,56 @@ function renumberKeys(card) {
 let modelList = [];
 let activeModelIdx = 0;
 
+// 常见服务商预设：点选自动填 Base URL，并给对应模型名占位提示
+const PROVIDER_PRESETS = [
+  { id: 'openai', label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
+  { id: 'deepseek', label: 'DeepSeek', url: 'https://api.deepseek.com', model: 'deepseek-chat' },
+  { id: 'moonshot', label: 'Moonshot / Kimi', url: 'https://api.moonshot.cn/v1', model: 'moonshot-v1-8k' },
+  { id: 'zhipu', label: '智谱 GLM', url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash' },
+  { id: 'siliconflow', label: '硅基流动', url: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen2.5-7B-Instruct' },
+  { id: 'dashscope', label: '通义千问', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+  { id: 'ollama', label: '本地 Ollama', url: 'http://127.0.0.1:11434', model: 'qwen2.5' },
+];
+
+// 与后端 SDK chat_completions_url 完全一致的拼接规则（前端实时预览用）：
+// 去尾部 /；已以 /chat/completions 结尾 → 原样；最后一段是 v数字 → 追加 /chat/completions；
+// 否则 → 追加 /v1/chat/completions。裸域名和带 /v1 都能正确工作。
+function chatCompletionsUrl(raw) {
+  const s = (raw || '').trim().replace(/\/+$/, '');
+  if (!s) return '';
+  if (/\/chat\/completions$/.test(s)) return s;
+  const last = s.split('/').pop() || '';
+  if (/^v\d+$/i.test(last)) return s + '/chat/completions';
+  return s + '/v1/chat/completions';
+}
+
+// Base URL 标准化：trim + 去尾斜杠；缺 scheme 自动补（本地地址补 http://，其余 https://）；
+// 去掉误填的请求路径（/chat、/chat/v1、/v1/chat/completions），DeepSeek 统一成站点根。
+function normalizeProviderUrl(raw) {
+  let s = (raw || '').trim().replace(/\/+$/, '');
+  // 只填了 scheme（如 "https://" / "https:"）视为空，避免拼出 https://https: 之类怪值
+  if (!s || /^[a-zA-Z][a-zA-Z0-9+.-]*:$/.test(s)) return '';
+  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) {
+    const local = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?(\/|$)/.test(s);
+    s = (local ? 'http://' : 'https://') + s;
+  }
+  s = s.replace(/\/(v1\/chat\/completions|chat\/completions|chat\/v1|chat)$/, '');
+  if (/^https?:\/\/api\.deepseek\.com(\/|$)/.test(s)) return 'https://api.deepseek.com';
+  return s.replace(/\/+$/, '');
+}
+
+// 合法性校验：必须是带主机名的 http(s) URL（只填 scheme 如 "https://" 视为无效）
+function isValidBaseUrl(raw) {
+  const t = (raw || '').trim();
+  if (!t || /\s/.test(t) || /^[a-zA-Z][a-zA-Z0-9+.-]*:\/*$/.test(t)) return false;
+  const s = normalizeProviderUrl(t);
+  if (!s) return false;
+  try {
+    const u = new URL(s);
+    return (u.protocol === 'http:' || u.protocol === 'https:') && !!u.hostname;
+  } catch { return false; }
+}
+
 function activeProvider() {
   if (!modelList.length) return null;
   return modelList[Math.min(activeModelIdx, modelList.length - 1)] || null;
@@ -3402,14 +3834,39 @@ function modelEditHTML(m, ordinal) {
   ks += '<button type="button" class="key-add" title="添加一个同配置 API Key">＋ 添加一个 Key</button></div>';
   return (
     '<div class="me-head">' +
-    '<span class="pc-badge">模型 ' + ordinal + '</span>' +
+    '<span class="pc-badge">配置 ' + ordinal + '</span>' +
     '<label class="me-name-wrap">显示名称 <input class="me-name" placeholder="如 主 API / 备用 API / 本地 Ollama" /></label>' +
+    '<label class="me-provider-wrap">服务商 <div class="dd me-provider"></div></label>' +
     '</div>' +
-    '<div class="pc-grid">' +
-    '<label class="pc-url-wrap">Base URL <input class="me-url" placeholder="OpenAI 兼容端点，如 https://api.openai.com/v1（带不带 /v1 均可）" /></label>' +
-    '<label class="pc-model-wrap">模型名 <input class="me-model" list="model-name-presets" placeholder="如 gpt-4o / qwen2.5 / deepseek-chat" /></label>' +
-    '<label class="pc-rpm-wrap">每个 Key 限额 RPM <input class="me-rpm" type="number" min="1" step="1" placeholder="20" /></label>' +
-    '</div>' + ks
+    '<div class="me-field me-keys-field">' +
+    '<label class="me-field-label">API Key</label>' + ks +
+    '</div>' +
+    '<div class="me-field">' +
+    '<label class="me-field-label">API 地址（OpenAI 兼容）</label>' +
+    '<input class="me-url" placeholder="https://api.openai.com/v1" spellcheck="false" autocomplete="off" />' +
+    '<p class="me-format-hint">标准格式：<code>https://主机名/v1</code>，填到 <code>/v1</code> 即可。只填域名会自动补 <code>https://</code> 与 <code>/v1</code>；不要带 <code>/chat/completions</code>。</p>' +
+    '<div class="me-url-feedback">' +
+    '<span class="me-url-preview"><span class="me-url-preview__label" data-i18n>最终请求地址：</span><code class="me-url-preview__url">—</code></span>' +
+    '<span class="me-url-error" hidden></span>' +
+    '</div>' +
+    '</div>' +
+    '<div class="me-field">' +
+    '<label class="me-field-label">模型</label>' +
+    '<div class="me-model-row">' +
+    '<div class="dd me-model-dd"></div>' +
+    '<input class="me-model" type="hidden" />' +
+    '<button type="button" class="btn-mini me-probe" title="用当前地址和 Key 请求 /v1/models，列出可用模型">探测模型</button>' +
+    '</div>' +
+    '<div class="me-model-manual" hidden>' +
+    '<input class="me-model-manual-input" placeholder="手动输入模型名，如 gpt-4o / deepseek-chat" spellcheck="false" />' +
+    '<button type="button" class="btn-mini me-model-manual-ok">确定</button>' +
+    '</div>' +
+    '<div class="me-models-panel" hidden></div>' +
+    '<span class="me-probe-error" hidden></span>' +
+    '</div>' +
+    '<div class="me-field me-rpm-field">' +
+    '<label class="me-field-label">每个 Key 限额 RPM <input class="me-rpm" type="number" min="1" step="1" placeholder="20" /></label>' +
+    '</div>'
   );
 }
 
@@ -3430,42 +3887,60 @@ function wireKeyList(edit) {
   });
 }
 
+// 一个配置下可切换的模型：当前模型 + 探测启用的 models（去重、去空）
+function modelsOf(m) {
+  const all = [m.model, ...(Array.isArray(m.models) ? m.models : [])];
+  return [...new Set(all.map((s) => (s || '').trim()).filter(Boolean))];
+}
+
 function renderModelSelector() {
   const sel = $('#model-select');
   const chatSel = $('#chat-model-select');
   const label = $('#model-select-label');
   const newBtn = $('#btn-model-new');
   const delBtn = $('#btn-model-del');
-  sel.innerHTML = '';
-  if (chatSel) chatSel.innerHTML = '';
-  const optFor = (s, value, text) => {
-    if (!s) return;
-    const o = document.createElement('option');
-    o.value = value;
-    o.textContent = text;
-    s.appendChild(o);
-  };
-  const textOf = (m, i) => (m.name || ('模型 ' + (i + 1))) + (m.model ? ' · ' + m.model : '');
-
-  if (label) label.textContent = '模型';
+  if (label) label.textContent = 'API 配置';
   if (newBtn) newBtn.hidden = false;
   if (delBtn) delBtn.hidden = false;
 
   if (!modelList.length) {
-    optFor(sel, '', '（还没有模型配置，点「＋ 新建」）');
-    if (chatSel) optFor(chatSel, '', '（无模型）');
+    mountDropdown(sel, { items: [], placeholder: '（还没有模型配置，点「＋ 新建」）' });
+    if (chatSel) mountDropdown(chatSel, { items: [], placeholder: '（无模型）', up: true });
     renderModelEdit();
     return;
   }
 
-  modelList.forEach((m, i) => optFor(sel, String(i), textOf(m, i)));
   activeModelIdx = Math.min(Math.max(activeModelIdx, 0), modelList.length - 1);
-  sel.value = String(activeModelIdx);
+  const textOf = (m, i) => {
+    const ms = modelsOf(m);
+    return (m.name || ('模型 ' + (i + 1))) + (ms.length > 1 ? ' · ' + ms.length + ' 个模型' : (ms[0] ? ' · ' + ms[0] : ''));
+  };
+  mountDropdown(sel, {
+    items: modelList.map((m, i) => ({ value: String(i), label: textOf(m, i) })),
+    value: String(activeModelIdx),
+    onChange: (v) => { switchActiveModel(parseInt(v, 10) || 0); },
+  });
 
   if (chatSel) {
-    chatSel.title = '在已保存的模型配置之间切换（立即生效）';
-    modelList.forEach((m, i) => optFor(chatSel, String(i), textOf(m, i)));
-    chatSel.value = String(activeModelIdx);
+    // 对话底部：把所有配置启用的模型摊平，一个模型一项，切换即生效
+    const items = [];
+    modelList.forEach((m, i) => {
+      modelsOf(m).forEach((mid) => {
+        items.push({ value: i + '::' + mid, label: (m.name || ('模型 ' + (i + 1))) + ' · ' + mid });
+      });
+    });
+    const cur = modelList[activeModelIdx];
+    mountDropdown(chatSel, {
+      items,
+      value: activeModelIdx + '::' + (cur.model || modelsOf(cur)[0] || ''),
+      searchable: items.length > 6,
+      placeholder: '（无模型）',
+      onChange: (v) => {
+        const [idxStr, ...rest] = String(v).split('::');
+        const idx = parseInt(idxStr, 10);
+        if (!Number.isNaN(idx) && modelList[idx]) switchActiveModel(idx, rest.join('::'));
+      },
+    });
   }
   renderModelEdit();
 }
@@ -3483,16 +3958,229 @@ function renderModelEdit() {
   box.querySelector('.me-url').value = m.base_url || '';
   box.querySelector('.me-model').value = m.model || '';
   box.querySelector('.me-rpm').value = m.rpm_limit ?? '';
-  wireKeyList(box);
+  if (!box._keyWired) { wireKeyList(box); box._keyWired = true; }
+  wireBaseUrlBox(box);
+  wireProviderDropdown(box, m);
+  wireModelPicker(box, m);
 }
 
-// Base URL 纠错：去掉误填的请求路径（/chat、/chat/v1、/v1/chat/completions），
-// DeepSeek 统一成站点根，否则会拼出 /chat/v1/chat/completions → 404。
-function normalizeProviderUrl(raw) {
-  let s = (raw || '').trim().replace(/\/+$/, '');
-  s = s.replace(/\/(v1\/chat\/completions|chat\/completions|chat\/v1|chat)$/, '');
-  if (s.includes('api.deepseek.com')) return 'https://api.deepseek.com';
-  return s;
+// 服务商：单个紧凑下拉（默认「自定义」），选中即填地址，替代原来一排预设按钮
+function wireProviderDropdown(box, m) {
+  const host = box.querySelector('.me-provider');
+  const urlInput = box.querySelector('.me-url');
+  const matchPreset = () => {
+    const norm = normalizeProviderUrl(urlInput.value);
+    const p = PROVIDER_PRESETS.find((x) => normalizeProviderUrl(x.url) === norm);
+    return p ? p.id : 'custom';
+  };
+  const dd = mountDropdown(host, {
+    items: [{ value: 'custom', label: '自定义' }].concat(
+      PROVIDER_PRESETS.map((p) => ({ value: p.id, label: p.label }))
+    ),
+    value: matchPreset(),
+    onChange: (v) => {
+      const p = PROVIDER_PRESETS.find((x) => x.id === v);
+      if (!p) return;
+      urlInput.value = p.url;
+      urlInput.dispatchEvent(new Event('input', { bubbles: true }));
+      const hidden = box.querySelector('.me-model');
+      if (!hidden.value.trim()) {
+        hidden.value = p.model;
+        m.model = p.model;
+        refreshModelDropdown(box, m);
+        renderModelsPanel(box, m);
+      }
+    },
+  });
+  urlInput.addEventListener('input', () => dd.setValue(matchPreset()));
+}
+
+// 模型选择：下拉（已启用 + 已探测 + 手动输入）＋「探测模型」＋ 多选面板
+function wireModelPicker(box, m) {
+  const hidden = box.querySelector('.me-model');
+  const probeBtn = box.querySelector('.me-probe');
+  const probeErr = box.querySelector('.me-probe-error');
+  const manualRow = box.querySelector('.me-model-manual');
+  const manualInput = box.querySelector('.me-model-manual-input');
+  const manualOk = box.querySelector('.me-model-manual-ok');
+
+  refreshModelDropdown(box, m);
+  renderModelsPanel(box, m);
+
+  const applyManual = () => {
+    const v = manualInput.value.trim();
+    if (!v) { manualInput.focus(); return; }
+    hidden.value = v;
+    m.model = v;
+    if (!Array.isArray(m.models)) m.models = [];
+    if (!m.models.includes(v)) m.models.push(v);
+    manualRow.hidden = true;
+    manualInput.value = '';
+    refreshModelDropdown(box, m);
+    renderModelsPanel(box, m);
+  };
+  manualOk.addEventListener('click', applyManual);
+  manualInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); applyManual(); }
+    if (e.key === 'Escape') { e.stopPropagation(); manualRow.hidden = true; }
+  });
+
+  probeBtn.addEventListener('click', async () => {
+    const urlInput = box.querySelector('.me-url');
+    const raw = (urlInput.value || '').trim();
+    probeErr.hidden = true;
+    if (!isValidBaseUrl(raw)) {
+      probeErr.textContent = '请先填写有效的 API 地址';
+      probeErr.hidden = false;
+      urlInput.focus();
+      return;
+    }
+    const keyInput = box.querySelector('.p-key');
+    const apiKey = keyInput ? keyInput.value.trim() : '';
+    probeBtn.disabled = true;
+    const oldText = probeBtn.textContent;
+    probeBtn.textContent = '探测中…';
+    probeBtn.classList.add('loading');
+    try {
+      const j = await apiPost('/api/models/probe', { base_url: raw, api_key: apiKey });
+      if (!j || j.ok === false) throw new Error((j && j.error) || '探测失败');
+      m._probed = j.models;
+      renderModelsPanel(box, m);
+      refreshModelDropdown(box, m);
+      toast('探测到 ' + j.models.length + ' 个模型，勾选后可在对话中切换', 'success');
+    } catch (err) {
+      probeErr.textContent = err.message;
+      probeErr.hidden = false;
+      toast('模型探测失败: ' + err.message, 'error');
+    } finally {
+      probeBtn.disabled = false;
+      probeBtn.textContent = oldText;
+      probeBtn.classList.remove('loading');
+    }
+  });
+}
+
+// 模型下拉 items：当前模型 ∪ 启用列表 ∪ 探测结果，末尾挂「手动输入…」
+function refreshModelDropdown(box, m) {
+  const host = box.querySelector('.me-model-dd');
+  if (!host) return;
+  const hidden = box.querySelector('.me-model');
+  const ids = [...new Set([...modelsOf(m), ...(m._probed || [])])];
+  const items = ids.map((id) => ({ value: id, label: id }));
+  items.push({ value: '__manual__', label: '手动输入模型名…' });
+  mountDropdown(host, {
+    items,
+    value: hidden.value || '',
+    placeholder: '选择或探测模型',
+    searchable: items.length > 8,
+    onChange: (v) => {
+      if (v === '__manual__') {
+        const row = box.querySelector('.me-model-manual');
+        row.hidden = false;
+        box.querySelector('.me-model-manual-input').focus();
+        host._dd.setValue(hidden.value || '');
+        return;
+      }
+      hidden.value = v;
+      m.model = v;
+      if (!Array.isArray(m.models)) m.models = [];
+      if (!m.models.includes(v)) m.models.push(v);
+      renderModelsPanel(box, m);
+    },
+  });
+}
+
+// 多选面板：探测/启用的模型勾选列表（搜索 + 全选/清空），当前模型锁定勾选
+function renderModelsPanel(box, m) {
+  const panel = box.querySelector('.me-models-panel');
+  if (!panel) return;
+  const ids = [...new Set([...(m._probed || []), ...(m.models || []), m.model].filter(Boolean))];
+  if (!ids.length) { panel.hidden = true; panel.innerHTML = ''; return; }
+  const enabled = new Set([...(m.models || []), m.model].filter(Boolean));
+  panel.hidden = false;
+  panel.innerHTML =
+    '<div class="me-models-head">' +
+    '<span class="me-models-title">勾选要在对话中切换的模型（已选 <b class="me-models-count">' + enabled.size + '</b>）</span>' +
+    '<span class="me-models-actions"><button type="button" class="btn-mini me-models-all">全选</button>' +
+    '<button type="button" class="btn-mini me-models-none">清空</button></span>' +
+    '</div>' +
+    (ids.length > 8 ? '<input class="me-models-search" placeholder="搜索模型…" />' : '') +
+    '<div class="me-models-list">' +
+    ids.map((id) => {
+      const isCur = id === m.model;
+      return '<label class="me-model-item' + (isCur ? ' current' : '') + '">' +
+        '<input type="checkbox" value="' + esc(id) + '"' + (enabled.has(id) ? ' checked' : '') + (isCur ? ' disabled' : '') + ' />' +
+        '<span class="me-model-id">' + esc(id) + '</span>' +
+        (isCur ? '<span class="me-model-cur">当前</span>' : '') +
+        '</label>';
+    }).join('') +
+    '</div>' +
+    '<p class="form-hint me-models-hint">保存后，勾选的模型会出现在对话界面底部的切换菜单里。</p>';
+
+  const sync = () => {
+    const checked = [...panel.querySelectorAll('input[type="checkbox"]:checked')].map((c) => c.value);
+    m.models = [...new Set([...checked, m.model].filter(Boolean))];
+    const cnt = panel.querySelector('.me-models-count');
+    if (cnt) cnt.textContent = String(m.models.length);
+  };
+  panel.querySelectorAll('input[type="checkbox"]').forEach((c) => c.addEventListener('change', sync));
+  panel.querySelector('.me-models-all').addEventListener('click', () => {
+    panel.querySelectorAll('input[type="checkbox"]').forEach((c) => { c.checked = true; });
+    sync();
+  });
+  panel.querySelector('.me-models-none').addEventListener('click', () => {
+    panel.querySelectorAll('input[type="checkbox"]').forEach((c) => { if (!c.disabled) c.checked = false; });
+    sync();
+  });
+  const search = panel.querySelector('.me-models-search');
+  if (search) search.addEventListener('input', () => {
+    const f = search.value.trim().toLowerCase();
+    panel.querySelectorAll('.me-model-item').forEach((it) => {
+      it.style.display = !f || it.querySelector('.me-model-id').textContent.toLowerCase().includes(f) ? '' : 'none';
+    });
+  });
+}
+
+// Base URL 输入框：实时预览最终请求地址 + 内联校验 + 失焦自动补 scheme + 服务商预设
+function wireBaseUrlBox(box) {
+  const urlInput = box.querySelector('.me-url');
+  const previewUrl = box.querySelector('.me-url-preview__url');
+  const previewWrap = box.querySelector('.me-url-preview');
+  const errEl = box.querySelector('.me-url-error');
+  if (!urlInput || !previewUrl) return;
+
+  const refresh = () => {
+    const raw = urlInput.value.trim();
+    const norm = normalizeProviderUrl(raw);
+    if (!raw) {
+      previewUrl.textContent = '—';
+      previewWrap.hidden = false;
+      errEl.hidden = true;
+      urlInput.classList.remove('is-invalid');
+      return;
+    }
+    if (!isValidBaseUrl(raw)) {
+      previewWrap.hidden = true;
+      errEl.hidden = false;
+      errEl.textContent = 'URL 无效，请检查格式（示例：https://api.openai.com/v1）';
+      urlInput.classList.add('is-invalid');
+      return;
+    }
+    errEl.hidden = true;
+    previewWrap.hidden = false;
+    urlInput.classList.remove('is-invalid');
+    previewUrl.textContent = chatCompletionsUrl(norm);
+  };
+
+  urlInput.addEventListener('input', refresh);
+  // 失焦：自动补 scheme / 去误填路径，让用户直接看到规范化后的值
+  urlInput.addEventListener('blur', () => {
+    const raw = urlInput.value.trim();
+    if (raw && isValidBaseUrl(raw)) urlInput.value = normalizeProviderUrl(raw);
+    refresh();
+  });
+
+  refresh();
 }
 
 // 把当前编辑区的内容写回内存（切模型/后端/保存前调用，避免未保存改动被覆盖）
@@ -3516,13 +4204,30 @@ function flushModelEdit() {
   const keys = Array.from(edit.querySelectorAll('.p-key')).map((el) => el.value.trim()).filter(Boolean);
   cur.api_keys = keys;
   cur.api_key = keys[0] || '';
+  const panel = edit.querySelector('.me-models-panel');
+  if (panel && !panel.hidden) {
+    const checked = Array.from(panel.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
+    cur.models = [...new Set([...checked, cur.model].filter(Boolean))];
+  }
 }
 
-// 只回写 providers / active_model（其余设置保持磁盘上的值），切换后立即生效
+// 提交用的 provider 行：过滤空地址、去掉仅前端用的临时字段（_probed 探测缓存）
+function cleanProviderRows(list) {
+  return list
+    .filter((p) => (p.base_url || '').trim())
+    .map((p) => {
+      const row = { ...p };
+      delete row._probed;
+      return row;
+    });
+}
+
+// 只回写 providers / active_model（其余设置保持磁盘上的值），切换后立即生效。
+// 返回是否成功：调用方据此给出成功反馈或回滚选择。
 async function saveModels() {
   try {
     const cfg = await apiGet('/api/config');
-    const rows = modelList.filter((p) => (p.base_url || '').trim());
+    const rows = cleanProviderRows(modelList);
     const active = activeProvider();
     cfg.providers = rows;
     if (active && rows.some((p) => p.name === active.name)) cfg.active_model = active.name;
@@ -3535,12 +4240,21 @@ async function saveModels() {
     cfg.sub_model = (rows[1] || {}).model || '';
     const r = await apiPost('/api/config', cfg);
     if (r && r.ok === false) throw new Error(r.error || '保存失败');
+    return true;
   } catch (e) {
     toast('模型切换保存失败: ' + e.message, 'error');
+    return false;
   }
 }
 
-async function loadConfig() {
+// 配置是否已成功加载过一次：未加载完成前禁止提交设置，
+// 避免冷启动竞态下用表单默认值（如未勾选的「启用语音」）覆盖磁盘配置。
+let configLoaded = false;
+async function loadConfig(retry = 0) {
+  const editBox = $('#model-edit');
+  if (editBox && !editBox.querySelector('.me-name')) {
+    editBox.innerHTML = '<p class="form-hint list-loading">加载中…<span class="db-dots"><i></i><i></i><i></i></span></p>';
+  }
   try {
     const cfg = await apiGet('/api/config');
     const form = $('#settings-form');
@@ -3574,6 +4288,7 @@ async function loadConfig() {
     form.rpm_limit.value = cfg.rpm_limit ?? 20;
     form.thinking_level.value = cfg.thinking_level || (cfg.enable_thinking ? 'high' : 'off');
     form.voice_enabled.checked = !!cfg.voice_enabled;
+    form.voice_system_mute.checked = cfg.voice_system_mute !== false;
     window.voiceEnabled = !!cfg.voice_enabled;
     form.ask_user_enabled.checked = cfg.ask_user_enabled !== false;
     form.tool_loading.value = cfg.tool_loading || 'progressive';
@@ -3585,7 +4300,13 @@ async function loadConfig() {
     const themeSel = $('#ui-theme');
     if (themeSel) themeSel.value = getUiTheme();
     loadToolLoadList();
-  } catch (e) { /* ignore */ }
+    configLoaded = true;
+  } catch (e) {
+    // 不再静默：设置加载失败给出可见错误 + 重试；同时防止空模型列表覆盖已有配置。
+    // 冷启动时 core 可能尚未就绪：自动退避重试几次，避免用户看到空配置。
+    renderListError(editBox, e.message, loadConfig);
+    if (retry < 4) setTimeout(() => loadConfig(retry + 1), 900);
+  }
 }
 
 // 渐进式加载：渲染「默认加载」工具开关列表（每项独立开关）
@@ -3627,7 +4348,7 @@ async function loadToolLoadList() {
       box.appendChild(row);
     });
   } catch (e) {
-    box.innerHTML = '<div class="tool-load-empty">读取工具列表失败</div>';
+    renderListError(box, e.message, loadToolLoadList, 'tool-load-empty');
   }
 }
 
@@ -3652,27 +4373,38 @@ function flashSaved() {
   });
 })();
 
-// 设置页模型下拉：列出全部模型配置
-$('#model-select').addEventListener('change', async (e) => {
-  const val = e.target.value;
-  if (!val) return;
+// 模型切换共用流程：保存期间禁用下拉（busy），成功 toast，失败回滚到原选择
+async function switchActiveModel(idx, modelId) {
+  const prevIdx = activeModelIdx;
+  const prevModel = modelList[prevIdx] ? modelList[prevIdx].model : '';
   flushModelEdit();
-  activeModelIdx = parseInt(val, 10) || 0;
-  renderModelSelector();
-  await saveModels();
-});
-
-// 对话界面底部直接切换模型，并立即持久化
-$('#chat-model-select').addEventListener('change', async (e) => {
-  const val = e.target.value;
-  if (!val) return;
-  const idx = parseInt(val, 10);
-  if (!Number.isNaN(idx) && modelList[idx]) {
-    activeModelIdx = idx;
-    renderModelSelector();
-    await saveModels();
+  activeModelIdx = idx;
+  if (modelId && modelList[idx]) {
+    modelList[idx].model = modelId;
+    if (!Array.isArray(modelList[idx].models)) modelList[idx].models = [];
+    if (!modelList[idx].models.includes(modelId)) modelList[idx].models.push(modelId);
   }
-});
+  renderModelSelector();
+  const triggers = [$('#model-select'), $('#chat-model-select')]
+    .filter(Boolean)
+    .map((s) => s.querySelector('.dd-trigger'))
+    .filter(Boolean);
+  triggers.forEach((t) => { t.disabled = true; });
+  const ok = await saveModels();
+  triggers.forEach((t) => { t.disabled = false; });
+  if (ok) {
+    const m = modelList[idx];
+    toast('已切换模型：' + ((m && m.name) || ('模型 ' + (idx + 1))) + (m && m.model ? ' · ' + m.model : ''), 'success');
+  } else {
+    // 保存失败：后端仍用旧配置，前端选择回滚，避免界面与真实生效模型脱节
+    activeModelIdx = prevIdx;
+    if (modelList[prevIdx]) modelList[prevIdx].model = prevModel;
+    renderModelSelector();
+  }
+  return ok;
+}
+
+// 模型切换由自定义下拉的 onChange 驱动（renderModelSelector 内挂载），无需原生 change 监听
 
 // 页面样式主题切换（本地 UI 偏好，立即生效，不入后端配置）
 $('#ui-theme').addEventListener('change', (e) => applyUiTheme(e.target.value));
@@ -3680,7 +4412,7 @@ $('#ui-theme').addEventListener('change', (e) => applyUiTheme(e.target.value));
 $('#btn-model-new').addEventListener('click', () => {
   flushModelEdit();
   const ord = modelList.length + 1;
-  modelList.push({ name: '模型 ' + ord, base_url: '', model: '', api_keys: [''], api_key: '', rpm_limit: null });
+  modelList.push({ name: '模型 ' + ord, base_url: '', model: '', api_keys: [''], api_key: '', rpm_limit: null, models: [] });
   activeModelIdx = modelList.length - 1;
   renderModelSelector();
   const url = document.querySelector('#model-edit .me-url');
@@ -3701,13 +4433,28 @@ $('#btn-model-del').addEventListener('click', async () => {
 
 $('#settings-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (!configLoaded) {
+    toast('设置尚未加载完成，请稍候再保存', 'error');
+    loadConfig();
+    return;
+  }
   const f = e.target;
   // 唤醒日志显隐是本地 UI 偏好（默认关闭），不入后端配置
   localStorage.setItem('kws_log_enabled', f.show_kws_log.checked ? '1' : '0');
   if (!f.show_kws_log.checked) kwsLog.hidden = true;
   // 模型配置：把当前编辑区的修改写回内存列表，再整体提交
   flushModelEdit();
-  const providerRows = modelList.filter((p) => p.base_url);
+  // Base URL 内联校验：任何一条非法都阻止保存，跳到该配置并标红输入框
+  const badIdx = modelList.findIndex((p) => (p.base_url || '').trim() && !isValidBaseUrl(p.base_url));
+  if (badIdx >= 0) {
+    activeModelIdx = badIdx;
+    renderModelSelector();
+    const badInput = document.querySelector('#model-edit .me-url');
+    if (badInput) { badInput.classList.add('is-invalid'); badInput.focus(); }
+    toast('Base URL 无效，请检查后再保存', 'error');
+    return;
+  }
+  const providerRows = cleanProviderRows(modelList);
   const activeName = modelList.length
     ? (modelList[Math.min(activeModelIdx, modelList.length - 1)].name || '')
     : '';
@@ -3745,6 +4492,7 @@ $('#settings-form').addEventListener('submit', async (e) => {
     thinking_level: f.thinking_level.value,
     enable_thinking: f.thinking_level.value !== 'off',
     voice_enabled: f.voice_enabled.checked,
+    voice_system_mute: f.voice_system_mute.checked,
     ask_user_enabled: f.ask_user_enabled.checked,
     tool_loading: f.tool_loading.value || 'progressive',
     context_feeding_enabled: f.context_feeding_enabled.checked,
@@ -3777,6 +4525,7 @@ $('#settings-form').addEventListener('submit', async (e) => {
       const r = await apiPost('/api/config', cfg);
       if (r && r.ok === false) throw new Error(r.error || '后端未确认');
       flashSaved();
+      renderModelSelector();
       toast('设置已保存，Agent 已重建', 'success');
     } catch (err) { toast('保存失败: ' + err.message, 'error'); }
   });
@@ -3870,7 +4619,16 @@ function refreshSquircles() {
     document.querySelectorAll(SQUIRCLE_SELECTOR).forEach(applySquircle);
   }, 120);
 }
-const squircleObserver = new MutationObserver(refreshSquircles);
+const squircleObserver = new MutationObserver((muts) => {
+  // 聊天流式区的每 token 变更不触发重算（避免高频全子树遍历/定时器抖动）；
+  // 其它区域（列表/设置/弹窗）新增节点时照常刷新圆角。
+  for (const m of muts) {
+    const el = m.target.nodeType === 1 ? m.target : m.target.parentElement;
+    if (el && el.closest('#chat-scroll')) continue;
+    refreshSquircles();
+    return;
+  }
+});
 squircleObserver.observe(document.body, { childList: true, subtree: true });
 window.addEventListener('resize', refreshSquircles);
 // 侧栏收起/展开等宽度动画结束后重算，保证圆角随尺寸变形
@@ -3974,7 +4732,7 @@ if (saDetailForm) saDetailForm.addEventListener('submit', async (e) => {
   sendBtn.disabled = false;
 });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && saDetailBox && !saDetailBox.hidden) closeSubagentDetail();
+  if (e.key === 'Escape' && !modalOpen && saDetailBox && !saDetailBox.hidden) closeSubagentDetail();
 });
 loadConfig();
 loadSessions();

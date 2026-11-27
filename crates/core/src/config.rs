@@ -61,6 +61,11 @@ pub fn default_context_recent() -> u32 {
     10
 }
 
+/// 回音防护默认走旧方案（录音期间系统静音），实测软件回音门不够可靠。
+pub fn default_voice_system_mute() -> bool {
+    true
+}
+
 /// serde 默认值：投喂窗口外、被压缩成摘要的消息条数
 pub fn default_context_compress() -> u32 {
     30
@@ -87,6 +92,9 @@ pub struct ProviderEntry {
     /// 同服务商同模型的多个 API Key：每个 Key 展开为一个独立轮询通道（同 URL、同模型）
     #[serde(default)]
     pub api_keys: Vec<String>,
+    /// 该上游探测到并启用的模型列表（对话界面可在其中切换）；空 = 仅用 model 字段
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 impl Default for ProviderEntry {
@@ -98,15 +106,28 @@ impl Default for ProviderEntry {
             model: String::new(),
             rpm_limit: None,
             api_keys: Vec::new(),
+            models: Vec::new(),
         }
     }
 }
 
 /// 纠正常见的 Base URL 误填：
+/// - 缺 scheme 自动补全（本地回环补 http://，其余补 https://）；
 /// - 去掉误加的 `/chat`、`/chat/v1`、`/v1/chat/completions` 等请求路径（SDK 会自行拼接完整路径）；
 /// - DeepSeek 统一为站点根 `https://api.deepseek.com`。
-fn normalize_base_url(raw: &str) -> String {
+/// 裸域名与带 `/v1` 的写法都被接受：SDK 按最后一段是否为版本号决定拼接方式。
+pub(crate) fn normalize_base_url(raw: &str) -> String {
     let mut s = raw.trim().trim_end_matches('/').to_string();
+    if s.is_empty() {
+        return s;
+    }
+    if !s.starts_with("http://") && !s.starts_with("https://") {
+        let local = s.starts_with("127.0.0.1")
+            || s.starts_with("localhost")
+            || s.starts_with("[::1]")
+            || s.starts_with("0.0.0.0");
+        s = format!("{}{s}", if local { "http://" } else { "https://" });
+    }
     for suffix in ["/v1/chat/completions", "/chat/completions", "/chat/v1", "/chat"] {
         if let Some(stripped) = s.strip_suffix(suffix) {
             s = stripped.to_string();
@@ -186,6 +207,10 @@ pub struct Config {
     pub kws_threshold: f32,
     /// 语音交互开关
     pub voice_enabled: bool,
+    /// 唤醒录音期间用 osascript 系统静音防回采（旧方案，默认启用）。
+    /// 设 false 可切换到软件回音门：TTS 播报期间丢弃麦克风帧，不改系统音量。
+    #[serde(default = "default_voice_system_mute")]
+    pub voice_system_mute: bool,
     /// 输出语言：zh | en | auto。
     /// zh/en = 提示词强制 AI 以该语言输出正文与【Voice】播报；auto = 由 AI 跟随用户输入语言。
     #[serde(default = "default_output_language")]
@@ -282,6 +307,7 @@ impl Default for Config {
             continuous_idle_rounds: 3,
             kws_threshold: 0.25,
             voice_enabled: true,
+            voice_system_mute: true,
             output_language: default_output_language(),
             voice_en: default_voice_en(),
             skill_dirs: Vec::new(),
@@ -333,7 +359,7 @@ impl Config {
             std::fs::create_dir_all(p)?;
         }
         let s = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, s)?;
+        crate::paths::atomic_write(path, s)?;
         Ok(())
     }
 
@@ -538,6 +564,23 @@ mod tests {
     #[test]
     fn default_config_is_internal() {
         assert_eq!(Config::default().tts_backend, TTS_BACKEND_INTERNAL);
+    }
+
+    #[test]
+    fn base_url_scheme_and_suffix_normalization() {
+        assert_eq!(normalize_base_url("api.openai.com/v1"), "https://api.openai.com/v1");
+        assert_eq!(normalize_base_url("api.openai.com"), "https://api.openai.com");
+        assert_eq!(
+            normalize_base_url("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com"
+        );
+        assert_eq!(normalize_base_url("127.0.0.1:11434"), "http://127.0.0.1:11434");
+        assert_eq!(normalize_base_url("localhost:8080/v1/"), "http://localhost:8080/v1");
+        assert_eq!(
+            normalize_base_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(normalize_base_url("  "), "");
     }
 
     #[test]

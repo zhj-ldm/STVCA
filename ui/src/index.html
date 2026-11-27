@@ -131,7 +131,7 @@
                 placeholder="输入指令，或说唤醒词「computer」后直接说话…"></textarea>
               <div class="composer-bar">
                 <div class="composer-meta">
-                  <select id="chat-model-select" class="chat-model-select" title="切换当前模型（所选配置写入设置并立即生效）"></select>
+                  <div id="chat-model-select" class="dd dd-up chat-model-select" title="切换当前模型（所选配置写入设置并立即生效）"></div>
                 </div>
                 <div class="composer-actions">
                   <span id="voice-wave" class="voice-wave" hidden aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
@@ -323,22 +323,15 @@
           <div class="settings-panels">
             <div class="settings-panel active" data-spanel="model">
               <fieldset class="api-fieldset">
-                <legend>模型</legend>
+                <legend>模型 API</legend>
                 <div class="model-select-row">
-                  <label class="ms-label" for="model-select" id="model-select-label">模型</label>
-                  <select id="model-select" class="model-select"></select>
+                  <span class="ms-label" id="model-select-label">API 配置</span>
+                  <div id="model-select" class="dd model-select"></div>
                   <button type="button" id="btn-model-new" class="btn-mini">＋ 新建</button>
                   <button type="button" id="btn-model-del" class="btn-mini btn-mini-danger">删除</button>
                 </div>
-                <datalist id="model-name-presets">
-                  <option value="deepseek-chat">DeepSeek 非思考</option>
-                  <option value="deepseek-reasoner">DeepSeek 思考</option>
-                  <option value="gpt-4o"></option>
-                  <option value="gpt-4o-mini"></option>
-                  <option value="qwen2.5"></option>
-                </datalist>
                 <div id="model-edit" class="model-edit"></div>
-                <p class="form-hint" id="model-hint">每条配置是一套 OpenAI 兼容端点 + 模型 + Key（如「主 API」「模型 2」…）。切换后立即保存并生效，对话界面底部也可直接切换。</p>
+                <p class="form-hint" id="model-hint">每条配置 = 一个 OpenAI 兼容端点（地址 + Key）+ 若干模型。填好地址和 Key 后点「探测模型」，勾选的模型会出现在对话界面底部的切换菜单里。</p>
                 <p class="form-hint">多个 API Key 会按 round-robin 分摊，各自遵守 RPM 限速；本地 Ollama 可留空 Key，关闭思考时自动使用 -nothink 变体。</p>
                 <label>AI 人设（身份 / 性格，可自由编辑）
                   <textarea name="main_system_prompt" rows="5"></textarea>
@@ -393,6 +386,12 @@
                 <div class="field-row">
                   <label>最长录音秒数 <input name="max_record_secs" type="number" step="0.5" /></label>
                   <label class="checkline"><input name="voice_enabled" type="checkbox" /> 启用语音</label>
+                </div>
+                <div class="field-row">
+                  <label class="checkline"><input name="voice_system_mute" type="checkbox" /> 录音时系统静音（防回音，推荐）</label>
+                </div>
+                <div class="field-row">
+                  <span class="form-hint">开启后录音期间临时静音系统输出、录完即恢复（提示音不受影响）；关闭则改用软件回音门，不改系统音量。</span>
                 </div>
                 <div class="field-row">
                   <label>静默结束秒数 <input name="silence_limit_secs" type="number" step="0.1" min="0.6" max="5" /></label>

@@ -56,6 +56,9 @@ pub enum Event {
     TurnFailed {
         session_id: String,
         message: String,
+        /// 是否值得原样重试（网络/上游/忙碌类失败 true；配置错误 false）
+        #[serde(default)]
+        retryable: bool,
     },
     /// AI 中间思考过程（主 agent，前端以左箭头折叠卡展示）
     ReasoningText {

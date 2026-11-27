@@ -129,7 +129,7 @@ impl SubagentManager {
         }
         match serde_json::to_string_pretty(&tasks) {
             Ok(s) => {
-                if let Err(e) = std::fs::write(&path, s) {
+                if let Err(e) = crate::paths::atomic_write(&path, s) {
                     tracing::warn!("保存 subagents.json 失败: {e}");
                 }
             }
@@ -455,16 +455,6 @@ fn trim_chars(s: &str, n: usize) -> String {
     }
 }
 
-const CHILD_SYSTEM_PROMPT: &str = "\
-你是 Star Trek Computer 的后台子 Agent，由主 Agent 派发，独立完成一项具体任务。
-
-工作规则：
-1. 直接动手执行，不要向用户提问，也不要输出【Voice】播报段。
-2. 优先用工具核实事实（read/write/edit/bash/WebSearch 等），文件路径一律使用绝对路径。
-3. 不要调用语音、子 Agent、交付卡片等能力；这些由主 Agent 负责。
-4. 任务完成后，用不超过 120 字的中文给出结果摘要：关键结论、产出文件路径、遗留问题。
-5. 如果任务无法完成，直接说明原因和已尝试的步骤，不要编造结果。";
-
 /// 子 Agent 的完整执行流程。失败/取消都会落到任务状态里，不向外 panic。
 /// messages 为本次运行的初始上下文（首次派发 = prompt；继续执行 = 历史上下文 + 新指令）。
 async fn run_task_loop(
@@ -487,7 +477,28 @@ async fn run_task_loop(
         let cfg = core.config.lock().await;
         cfg.max_turns.clamp(5, 60) as usize
     };
-    let tools = child_tools();
+    // 与主 Agent 对齐：同一份语言指令 / 核心规则 / 人设 / Skills 目录 / 长期记忆，
+    // 外加后台执行规则（子 Agent 版本）。
+    let system_prompt = {
+        let cfg = core.config.lock().await;
+        let skills_text = core.skills.usage_text().await;
+        let memory_text = core.memory.context_text(30).await;
+        crate::agents::compose_child_system_prompt(&cfg, &skills_text, &memory_text)
+    };
+    // 工具全量默认加载：基础工作工具 + 技能/MCP 能力 + 已连接 MCP 服务的全部工具。
+    let tools = {
+        let mut t = child_tools(&core);
+        for (cfg, infos) in core.mcp.agent_tools().await {
+            for info in infos {
+                t.push(Arc::new(crate::tools::McpTool::new(
+                    core.clone(),
+                    &cfg.name,
+                    &info,
+                )));
+            }
+        }
+        t
+    };
     let ctx_tools: Vec<_> = tools.iter().map(|t| t.schema().clone()).collect();
     let mut final_text = String::new();
     let mut status = "done";
@@ -519,7 +530,7 @@ async fn run_task_loop(
             });
         }
         let ctx = Context {
-            system_prompt: Some(CHILD_SYSTEM_PROMPT.to_string()),
+            system_prompt: Some(system_prompt.clone()),
             messages: messages.clone(),
             tools: ctx_tools.clone(),
         };
@@ -633,6 +644,38 @@ async fn run_task_loop(
                 text_entry("assistant", &trim_chars(&round_text, 4000)),
             )
             .await;
+        }
+        // 上游按长度截断：这一轮的助手消息没有回填（上面跳过），
+        // 半截工具调用绝不能执行后把 tool_result 回填成孤儿消息（上游会直接 400）。
+        // 丢弃调用并留痕，换小步继续；连续截断则按失败收尾。
+        if stop_reason == StopReason::Length {
+            for call in calls.drain(..) {
+                record_trace(
+                    &core,
+                    &manager,
+                    &id,
+                    &task.parent_session,
+                    TraceEntry {
+                        kind: "tool".into(),
+                        text: "输出被长度限制截断，该调用已丢弃".into(),
+                        name: Some(call.name.clone()),
+                        input: Some(call.arguments.clone()),
+                        ok: Some(false),
+                        at: now_ms(),
+                    },
+                )
+                .await;
+            }
+            if stall_retries < 2 && turn + 1 < max_turns {
+                stall_retries += 1;
+                messages.push(user_msg(
+                    "上一条回复因输出长度限制被截断，任务还没完成。请继续：不要重复已完成的步骤；写文件用 write 工具，长内容拆成多次较小的写入或追加，最后给简短结果摘要。",
+                ));
+                continue;
+            }
+            error = Some("输出连续被上游长度限制截断，任务未完成".into());
+            status = "failed";
+            break;
         }
         if calls.is_empty() {
             if round_text.trim().is_empty() && stall_retries < 2 && turn + 1 < max_turns {

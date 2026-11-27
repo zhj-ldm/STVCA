@@ -19,8 +19,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-/// 子 Agent 的独立工具集：只做实际工作，不含语音/交付/子 Agent 能力。
-pub(crate) fn child_tools() -> Vec<Arc<dyn AgentTool>> {
+/// 子 Agent 的独立工具集：与主 Agent 相同的实际工作能力（文件/命令/搜索/Skills/MCP），
+/// 全部默认加载（无渐进门控）；不含语音/交付/子 Agent 派发（这些由主 Agent 负责）。
+pub(crate) fn child_tools(core: &Arc<CoreState>) -> Vec<Arc<dyn AgentTool>> {
     use crate::search::WebSearchTool;
     use rpi_tools::{
         create_bash_tool, create_edit_tool, create_read_tool, create_write_tool,
@@ -41,6 +42,9 @@ pub(crate) fn child_tools() -> Vec<Arc<dyn AgentTool>> {
         Arc::new(GrepTool),
         Arc::new(FindTool),
         Arc::new(CurlTool),
+        // 与主 Agent 同源的扩展能力：安装 Skills、连接 MCP 服务
+        Arc::new(ImportSkill::new(core.clone())),
+        Arc::new(ConnectMcp::new(core.clone())),
     ]
 }
 
@@ -77,14 +81,16 @@ fn extract_announce_text(raw: &str) -> String {
     const LEGACY: &str = "【语音播报】";
     // 找到标记 → 只取标记后的朗读内容；标记后为空（空标记）也回退全文，
     // 保证用户最终总能听到内容；无标记 → 回退 AI 最终回复全文。
-    let text = if let Some(pos) = raw.find(MARKER) {
+    // 用 rfind 取最后一个标记：多轮正文拼接后，前面轮次的【Voice】段
+    // 不应被当成最终播报（否则念的是中间轮次的旧结论）。
+    let text = if let Some(pos) = raw.rfind(MARKER) {
         let t = raw[pos + MARKER.len()..].trim().to_string();
         if t.is_empty() {
             raw.trim().to_string()
         } else {
             t
         }
-    } else if let Some(pos) = raw.find(LEGACY) {
+    } else if let Some(pos) = raw.rfind(LEGACY) {
         let t = raw[pos + LEGACY.len()..].trim().to_string();
         if t.is_empty() {
             raw.trim().to_string()
@@ -191,7 +197,7 @@ fn strip_markdown_for_tts(raw: &str) -> String {
     lines.join("\n")
 }
 
-pub async fn auto_announce(core: Arc<CoreState>, text: String) {
+pub async fn auto_announce(core: Arc<CoreState>, text: String, turn_gen: u64) {
     let text = extract_announce_text(&text);
     tracing::info!(
         "auto_announce text ({} chars): {}",
@@ -201,8 +207,13 @@ pub async fn auto_announce(core: Arc<CoreState>, text: String) {
     if text.is_empty() {
         return;
     }
-    // 互斥：已有语音正在播报时跳过本次（不排队、不累积）
-    if core.speaking.load(Ordering::SeqCst) {
+    // 互斥（CAS）：已有语音正在播报时跳过本次（不排队、不累积），
+    // check-then-set 会让两个并发轮次同时通过检查、双双开播。
+    if core
+        .speaking
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         tracing::info!("自动播报跳过：已有语音正在播报");
         return;
     }
@@ -210,7 +221,6 @@ pub async fn auto_announce(core: Arc<CoreState>, text: String) {
         kind: "speak_start".into(),
         text: text.clone(),
     });
-    core.speaking.store(true, Ordering::SeqCst);
 
     // TTS 后台异步播报，不阻塞主 Agent 循环（main_busy 只覆盖 LLM+工具逻辑）
     tokio::spawn(async move {
@@ -225,8 +235,8 @@ pub async fn auto_announce(core: Arc<CoreState>, text: String) {
             )
         };
         let text2 = text.clone();
-        // 打断优先：播报前再确认一次，避免打断后 AI 仍继续说话
-        let result: Result<(), String> = if core.interrupt_main.load(Ordering::SeqCst) {
+        // 打断优先：播报前再确认一次（按轮次代号匹配），避免打断后 AI 仍继续说话
+        let result: Result<(), String> = if core.is_main_interrupted(turn_gen) {
             tracing::info!("打断生效：跳过 TTS 播报");
             Ok(())
         } else {
@@ -429,7 +439,9 @@ impl AgentTool for ToolGuide {
                 serde_json::to_string(&tool.parameters.as_value()).unwrap_or_default()
             )));
         }
-        // 2) 技能：直接返回完整说明文档
+        // 2) 技能：直接返回完整说明文档。
+        // 清单里技能写作 skill:名称，模型会原样带前缀请求——两种写法都接受。
+        let skill_name = name.strip_prefix("skill:").unwrap_or(name).trim();
         let skill = self
             .hub
             .core()
@@ -437,7 +449,7 @@ impl AgentTool for ToolGuide {
             .list()
             .await
             .into_iter()
-            .find(|s| s.enabled && s.name == name);
+            .find(|s| s.enabled && s.name == skill_name);
         if let Some(skill) = skill {
             let usage = crate::skills::read_usage(&skill.path);
             return Ok(AgentToolResult::text(if usage.trim().is_empty() {
@@ -1259,9 +1271,9 @@ impl AgentTool for AskUserTool {
             let beep_path = crate::paths::resource("complete.mp3")
                 .to_string_lossy()
                 .into_owned();
-            let v = core.voice.clone();
+            let c = core.clone();
             tokio::spawn(async move {
-                let _ = v.beep(Some(&beep_path)).await;
+                crate::agents::beep_audible(&c, Some(&beep_path)).await;
             });
         }
         // 5) 返回用户的语音回复

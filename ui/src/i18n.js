@@ -1,7 +1,8 @@
 // 界面中英文切换：以「中文原文」为 key 的字典 + DOM 自动翻译。
-// - 静态 HTML 与 JS 动态生成的内容都会被翻译（MutationObserver 监听新增/变更节点）。
+// - 只翻译静态 UI 文本（新增文案带 data-i18n 标记并补字典）。
+// - 用户输入 / AI 回复 / 会话标题等内容区（CONTENT_SEL）一律排除，
+//   MutationObserver 对其变更直接跳过，聊天流式区零遍历。
 // - 原文会记录在节点上，切回中文时可无损还原。
-// 无需逐处加 data-i18n 属性，运维成本最低。
 'use strict';
 
 (function () {
@@ -203,6 +204,7 @@
     '任务已打断': 'Task interrupted',
     '已中断': 'Interrupted',
     '已完成': 'Done',
+    '成功': 'OK',
     '失败': 'Failed',
     '调用参数': 'Arguments',
     '返回结果': 'Result',
@@ -263,6 +265,125 @@
     'OpenAI 兼容端点，如 https://api.openai.com/v1（带不带 /v1 均可）': 'OpenAI-compatible endpoint, e.g. https://api.openai.com/v1 (/v1 optional)',
     '还没有模型配置，点「＋ 新建」添加第一套。': 'No model config yet — click "＋ New" to add one.',
     '暂无唤醒检测记录 —— 请开启监听并尝试说唤醒词，这里会显示每次检测的样本量 / 音量 / 耗时。': 'No wake detections yet — enable listening and try saying the wake word; each detection\'s sample count / volume / latency shows here.',
+
+    // ---- 子 Agent ----
+    '子 Agent': 'Subagents',
+    '子 AGENT': 'SUBAGENTS',
+    '连接器': 'Connectors',
+    '暂无子 Agent': 'No subagents yet',
+    '在对话里让 AI 处理复杂、耗时的任务时，它会自动派发子 Agent，并在这里显示进度。': 'When the AI handles complex, long-running tasks in chat, it dispatches subagents and shows their progress here.',
+    '主 AI 在后台派发的独立任务。复杂任务会自动出现在这里，可查看进度、进入全屏详情继续对话，或按时间批量清理历史记录。': 'Independent tasks dispatched by the main AI in the background. Complex tasks appear here; view progress, open full-screen details to continue the conversation, or purge history by age.',
+    '查看对话': 'View chat',
+    '查看详情': 'View details',
+    '中止任务': 'Cancel task',
+    '正在中止…': 'Cancelling…',
+    '运行中': 'Running',
+    '已取消': 'Cancelled',
+    '展开全文': 'Expand',
+    '收起': 'Collapse',
+    '内容过长时自动折叠': 'Long content auto-collapses',
+    '子 Agent 详情': 'Subagent details',
+    '正在加载执行轨迹…': 'Loading trace…',
+    '暂时还没有执行轨迹。': 'No trace yet.',
+    '思考过程': 'Thought process',
+    '指令': 'Instruction',
+    '未命名任务': 'Untitled task',
+    '未命名对话': 'Untitled chat',
+    '来源对话': 'Source chat',
+    '← 退出': '← Back',
+    '给子 Agent 发送后续指令…': 'Send a follow-up instruction to the subagent…',
+    '同时删除对话卡片': 'Also delete chat cards',
+    '删除任务时同时移除主对话中的完成卡片': 'Also remove the completion card in the main chat when deleting a task',
+    '按时间批量清理': 'Purge by age',
+    '24 小时前': 'Older than 24h',
+    '7 天前': 'Older than 7 days',
+    '30 天前': 'Older than 30 days',
+    '全部历史': 'All history',
+    '清理': 'Purge',
+    '刷新': 'Refresh',
+    '子 Agent 运行中': 'Subagent running',
+    '子 Agent 已完成': 'Subagent done',
+    '子 Agent 执行失败': 'Subagent failed',
+    '子 Agent 已取消': 'Subagent cancelled',
+    '正在准备…': 'Preparing…',
+    '正在执行…': 'Running…',
+    '已加入队列，等待下一轮…': 'Queued, waiting for next round…',
+    '继续执行…': 'Continuing…',
+    '指令已加入队列': 'Instruction queued',
+    '子 Agent 已继续执行': 'Subagent resumed',
+    '任务不存在': 'Task not found',
+
+    // ---- MCP ----
+    '已连接': 'Connected',
+    '未连接': 'Disconnected',
+    '重新连接': 'Reconnect',
+    '添加 MCP 服务': 'Add MCP server',
+    '添加并连接': 'Add & connect',
+    '已连接 (': 'Connected (',
+    '暂无 MCP 服务，右侧添加后会自动连接。': 'No MCP servers yet — add one on the right to auto-connect.',
+    '支持 stdio 与 HTTP/SSE 传输，添加后会立即尝试 initialize 与 tools/list。': 'Supports stdio and HTTP/SSE transports; initialize and tools/list run immediately after adding.',
+    '名称，如 filesystem': 'Name, e.g. filesystem',
+    '启动命令，如 npx': 'Command, e.g. npx',
+    '参数，用空格分隔：-y @modelcontextprotocol/server-filesystem ~/Documents': 'Args, space-separated: -y @modelcontextprotocol/server-filesystem ~/Documents',
+    'URL，如 http://127.0.0.1:3000/mcp': 'URL, e.g. http://127.0.0.1:3000/mcp',
+    '请填写名称': 'Please enter a name',
+    '正在连接…': 'Connecting…',
+
+    // ---- 定时频率 ----
+    '执行频率': 'Frequency',
+    '每天': 'Daily',
+    '每周': 'Weekly',
+    '每月': 'Monthly',
+    '每小时': 'Hourly',
+    '每小时整点': 'Every hour on the hour',
+    '自定义 cron（高级）': 'Custom cron (advanced)',
+    '周一': 'Mon', '周二': 'Tue', '周三': 'Wed', '周四': 'Thu', '周五': 'Fri', '周六': 'Sat', '周日': 'Sun',
+    '任务标题，如「早上汇报天气」': 'Task title, e.g. "morning weather report"',
+    '到点后交给主 Agent 执行的指令，如「查一下今天天气并播报」': 'Instruction for the main Agent, e.g. "check today\'s weather and announce it"',
+    'cron 表达式，如 0 8 * * *': 'cron expression, e.g. 0 8 * * *',
+
+    // ---- 加载 / 错误 / 操作反馈 ----
+    '加载中…': 'Loading…',
+    '重试': 'Retry',
+    '复制失败，请手动选择文本复制': 'Copy failed — please select the text and copy manually',
+    '开启中…': 'Starting…',
+    '关闭中…': 'Stopping…',
+    '已启用': 'Enabled',
+    '已停用': 'Disabled',
+    '有新输入进入了其他会话，可在侧栏点击查看': 'New input went to another chat — click it in the sidebar',
+    '读取工具列表失败': 'Failed to load tool list',
+
+    // ---- Base URL 标准化 ----
+    '快捷填入': 'Quick fill',
+    '最终请求地址：': 'Final request URL: ',
+    '填到 /v1 即可，也可只填域名，系统会自动补全请求路径。': 'Enter up to /v1, or just the domain — the request path is completed automatically.',
+    'URL 无效，请检查格式（示例：https://api.openai.com/v1）': 'Invalid URL — check the format (e.g. https://api.openai.com/v1)',
+    'Base URL 无效，请检查后再保存': 'Invalid Base URL — fix it before saving',
+    'API 地址（OpenAI 兼容）': 'API URL (OpenAI-compatible)',
+    '服务商': 'Provider',
+    '自定义': 'Custom',
+    'API 配置': 'API profile',
+    '探测模型': 'Fetch models',
+    '探测中…': 'Fetching…',
+    '选择或探测模型': 'Select or fetch models',
+    '手动输入模型名…': 'Enter a model name…',
+    '手动输入模型名，如 gpt-4o / deepseek-chat': 'Enter a model name, e.g. gpt-4o / deepseek-chat',
+    '搜索模型…': 'Search models…',
+    '用当前地址和 Key 请求 /v1/models，列出可用模型': 'Query /v1/models with the current URL and key to list available models',
+    '全选': 'Select all',
+    '当前': 'current',
+    '无匹配项': 'No matches',
+    '搜索…': 'Search…',
+    '请选择': 'Select…',
+    '保存后，勾选的模型会出现在对话界面底部的切换菜单里。': 'After saving, checked models appear in the switcher at the bottom of the chat.',
+    '录音时系统静音（防回音，推荐）': 'Mute system output while recording (anti-echo, recommended)',
+    '开启后录音期间临时静音系统输出、录完即恢复（提示音不受影响）；关闭则改用软件回音门，不改系统音量。': 'While recording, system output is temporarily muted and restored afterwards (beeps stay audible). Off = software echo gate, system volume untouched.',
+    '显示名称': 'Display name',
+    '如 主 API / 备用 API / 本地 Ollama': 'e.g. Main API / Backup API / local Ollama',
+    '本地 Ollama': 'Local Ollama',
+    '智谱 GLM': 'Zhipu GLM',
+    '硅基流动': 'SiliconFlow',
+    '通义千问': 'Qwen (DashScope)',
   };
 
   // 前缀规则：动态拼接（如 '删除失败: ' + msg）时只翻译前缀。
@@ -295,6 +416,19 @@
     ['移除 MCP 服务「', 'Remove MCP server "'],
     ['删除记忆「', 'Delete memory "'],
     ['删除模型配置「', 'Delete model config "'],
+    ['加载失败：', 'Load failed: '],
+    ['连接失败: ', 'Connect failed: '],
+    ['中止失败: ', 'Cancel failed: '],
+    ['清理失败: ', 'Purge failed: '],
+    ['已切换模型：', 'Model switched: '],
+    ['子 Agent 已完成：', 'Subagent done: '],
+    ['删除子 Agent「', 'Delete subagent "'],
+    ['确定清理 ', 'Purge records from '],
+    ['来源: ', 'Source: '],
+    ['对话：', 'Chat: '],
+    ['参数：', 'Args: '],
+    ['结果：', 'Result: '],
+    ['如 ', 'e.g. '],
   ];
 
   // 正则规则：带数字的拼接文本。
@@ -303,6 +437,16 @@
     [/^(\d+) 分$/, (m) => `${m[1]} min`],
     [/^(\d+) 秒$/, (m) => `${m[1]} s`],
     [/^(\d+) 个文件$/, (m) => `${m[1]} files`],
+    [/^(\d+) 个工具$/, (m) => `${m[1]} tools`],
+    [/^(\d+) 号$/, (m) => `Day ${m[1]}`],
+    [/^共 (\d+) 条(?: · 运行中 (\d+))?$/, (m) => `${m[1]} total` + (m[2] ? ` · ${m[2]} running` : '')],
+    [/^已清理 (\d+) 条记录$/, (m) => `Purged ${m[1]} records`],
+    [/^每小时第 (\d+) 分$/, (m) => `Hourly at :${String(m[1]).padStart(2, '0')}`],
+    [/^每天 (\d{2}:\d{2})$/, (m) => `Daily ${m[1]}`],
+    [/^每周([日一二三四五六]) (\d{2}:\d{2})$/, (m) => `Weekly ${{ '日': 'Sun', '一': 'Mon', '二': 'Tue', '三': 'Wed', '四': 'Thu', '五': 'Fri', '六': 'Sat' }[m[1]]} ${m[2]}`],
+    [/^每月 (\d+) 号 (\d{2}:\d{2})$/, (m) => `Monthly day ${m[1]} ${m[2]}`],
+    // 定时任务 meta 行：「每天 08:00 · 上次: 从未」→ 前半段递归翻译，后半段固定格式
+    [/^(.+) · 上次: (.+)$/, (m) => `${translate(m[1])} · last: ${m[2] === '从未' ? 'never' : m[2]}`],
   ];
 
   const ATTRS = ['title', 'placeholder', 'aria-label'];
@@ -354,8 +498,39 @@
     }
   }
 
+  // ---- 内容区保护（白名单机制） ----
+  // 只翻译静态 UI 文本；用户输入 / AI 回复 / 会话标题 / 记忆内容等一切「内容节点」
+  // 一律不碰——否则气泡内容恰好是「保存」「发送」等词条时会被字典改写。
+  // 新增静态 UI 文案请带 data-i18n 标记（并补字典）；内容区选择器如下。
+  const CONTENT_SEL = [
+    '#chat-scroll',                 // 对话流（含流式渲染区，整体排除）
+    '.sa-tr__bubble', '.sa-tr pre', // 子 Agent 轨迹里的气泡 / 工具输入输出
+    '#kws-log-body',                // 唤醒日志（含识别文本）
+    '.sa-item__title', '.sa-item__summary', '.sa-item__progress',
+    '.sa-card__title', '.sa-card__summary',
+    '.sa-detail__title', '.sa-detail__sub',
+    '.s-name', '#collapsed-chat-title',          // 会话标题（用户命名）
+    '.list-item .title', '.list-item .body',     // 记忆标题/内容、skill 名称/描述
+    '.mcp-meta', '.mcp-tool',                    // MCP 地址 / 工具名
+    '.db-deliver',                               // 交付文件名/描述
+    '.me-url-preview__url',                      // Base URL 预览（纯 URL）
+    '.me-model-id',                              // 探测到的模型 ID（内容，非 UI 文案）
+  ].join(',');
+  function inContent(node) {
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    return !!(el && el.closest(CONTENT_SEL));
+  }
+
   function walk(root, fn) {
-    const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, null);
+    if (root.nodeType === 3) { if (!inContent(root)) fn.text(root); return; }
+    if (root.nodeType !== 1 || root.matches(CONTENT_SEL)) return;
+    // TreeWalker 过滤器：命中内容区直接 REJECT（跳过整棵子树，流式区零遍历）
+    const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (n.nodeType === 1 && n.matches(CONTENT_SEL)) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
     let n = tw.currentNode;
     while (n) {
       if (n.nodeType === 3) fn.text(n);
@@ -383,10 +558,13 @@
       applying = true;
       try {
         for (const m of muts) {
+          // 内容区（含聊天流式区）的任何变更直接跳过：
+          // 既保护用户/模型文本，也避免每 token 全子树遍历
+          if (inContent(m.target)) continue;
           if (m.type === 'characterData') doText(m.target);
           else if (m.type === 'attributes') doEl(m.target);
           else m.addedNodes.forEach((n) => {
-            if (n.nodeType === 3) doText(n);
+            if (n.nodeType === 3) { if (!inContent(n)) doText(n); }
             else if (n.nodeType === 1) walk(n, { text: doText, el: doEl });
           });
         }

@@ -167,7 +167,7 @@ impl Scheduler {
         }
         let list = self.tasks.read().await;
         let s = serde_json::to_string_pretty(&*list)?;
-        std::fs::write(&self.path, s)?;
+        crate::paths::atomic_write(&self.path, s)?;
         Ok(())
     }
 }

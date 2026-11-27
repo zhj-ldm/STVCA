@@ -167,7 +167,7 @@ impl McpManager {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = serde_json::to_string_pretty(list).map_err(|e| e.to_string())?;
-        std::fs::write(&self.path, text).map_err(|e| format!("写入 MCP 配置失败: {e}"))
+        crate::paths::atomic_write(&self.path, text).map_err(|e| format!("写入 MCP 配置失败: {e}"))
     }
 
     pub async fn list(&self) -> Vec<McpServerConfig> {
@@ -316,7 +316,17 @@ impl McpManager {
                     lines,
                     next_id,
                     ..
-                } => stdio_rpc(stdin, lines, next_id, "tools/list", json!({})).await,
+                } => {
+                    stdio_rpc(
+                        stdin,
+                        lines,
+                        next_id,
+                        "tools/list",
+                        json!({}),
+                        Duration::from_secs(8),
+                    )
+                    .await
+                }
                 McpSession::Http { sid } => {
                     let client = http_client();
                     post_rpc(
@@ -412,7 +422,7 @@ impl McpManager {
                 } => {
                     timeout(
                         CALL_TIMEOUT,
-                        stdio_rpc(stdin, lines, next_id, "tools/call", params.clone()),
+                        stdio_rpc(stdin, lines, next_id, "tools/call", params.clone(), CALL_TIMEOUT),
                     )
                     .await
                     .unwrap_or_else(|_| Err("MCP 工具调用超时（60s）".into()))
@@ -464,6 +474,12 @@ impl McpManager {
                     drop(guard);
                     self.drop_session_if(server, &shared).await;
                     last_err = e;
+                    // 超时不重试：tools/call 非幂等，慢工具可能已在服务端执行
+                    // （发消息/写文件），盲目重发会造成二次副作用。
+                    // 只有传输层错误（进程退出/会话过期）才重建会话重试一次。
+                    if last_err.contains("超时") {
+                        break;
+                    }
                     if attempt == 0 {
                         continue;
                     }
@@ -601,7 +617,7 @@ async fn establish(cfg: &McpServerConfig) -> Result<McpSession, String> {
             let mut next_id = 1u64;
 
             send_line(&mut stdin, rpc_line(next_id, "initialize", init_params())).await?;
-            let resp = read_response(&mut lines, next_id).await?;
+            let resp = read_response(&mut lines, next_id, Duration::from_secs(8)).await?;
             if let Some(err) = resp.get("error") {
                 let _ = child.start_kill();
                 return Err(format!("initialize 失败: {err}"));
@@ -739,14 +755,17 @@ async fn establish(cfg: &McpServerConfig) -> Result<McpSession, String> {
     }
 }
 
-/// 读 stdio 输出直到拿到指定 id 的响应（跳过通知/无关行）
+/// 读 stdio 输出直到拿到指定 id 的响应（跳过通知/无关行）。
+/// wait = 单行等待上限：探测/握手用 8s，工具调用必须与外层 CALL_TIMEOUT 一致，
+/// 否则慢工具在 8s 就被误判超时、外层 60s 形同虚设。
 async fn read_response(
     lines: &mut Lines<BufReader<ChildStdout>>,
     id: u64,
+    wait: Duration,
 ) -> Result<Value, String> {
     loop {
-        let line = match timeout(Duration::from_secs(8), lines.next_line()).await {
-            Err(_) => return Err("等待 MCP 响应超时".into()),
+        let line = match timeout(wait, lines.next_line()).await {
+            Err(_) => return Err(format!("等待 MCP 响应超时（{}s）", wait.as_secs())),
             Ok(Ok(Some(l))) => l,
             Ok(Ok(None)) => return Err("MCP 进程已退出".into()),
             Ok(Err(e)) => return Err(format!("读取 MCP 输出失败: {e}")),
@@ -770,11 +789,12 @@ async fn stdio_rpc(
     next_id: &mut u64,
     method: &str,
     params: Value,
+    wait: Duration,
 ) -> Result<Value, String> {
     let id = *next_id;
     *next_id += 1;
     send_line(stdin, rpc_line(id, method, params)).await?;
-    read_response(lines, id).await
+    read_response(lines, id, wait).await
 }
 
 // ============================================================

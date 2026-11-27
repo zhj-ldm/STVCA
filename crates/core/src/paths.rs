@@ -63,3 +63,20 @@ pub fn home_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|_| project_root())
 }
+
+/// 原子落盘：先写同目录临时文件再 rename 覆盖目标。
+/// 直接 `fs::write` 在写入中途被强杀会留下半截 JSON，下次启动整库解析失败、
+/// 数据被静默清零（config.json 尤甚——会丢 API Key）。rename 是原子操作，
+/// 读者要么看到旧完整内容、要么看到新完整内容，不会读到半截。
+/// 调用方负责先 create_dir_all 父目录；这里失败时清理临时文件并返回错误。
+pub fn atomic_write(path: &std::path::Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}

@@ -15,12 +15,26 @@ class ApiError extends Error {
   }
 }
 
-async function api(method, path, body, timeoutMs = 15000) {
+async function api(method, path, body, timeoutMs = 15000, signal = null) {
+  // 超时信号 + 调用方取消信号（会话切换等）合并：任一触发即中止请求
+  let sig = AbortSignal.timeout(timeoutMs);
+  if (signal) {
+    if (typeof AbortSignal.any === 'function') {
+      sig = AbortSignal.any([sig, signal]);
+    } else {
+      const c = new AbortController();
+      const onAbort = () => c.abort();
+      if (signal.aborted) c.abort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+      sig.addEventListener('abort', () => { c.abort(); signal.removeEventListener('abort', onAbort); }, { once: true });
+      sig = c.signal;
+    }
+  }
   const opts = {
     method,
     headers: {},
     // 本地后端不应超过阈值；超时/后端未启动时统一抛 ApiError(status=0)
-    signal: AbortSignal.timeout(timeoutMs),
+    signal: sig,
   };
   if (body !== undefined) {
     opts.headers['Content-Type'] = 'application/json';
@@ -30,6 +44,12 @@ async function api(method, path, body, timeoutMs = 15000) {
   try {
     res = await fetch(CORE + path, opts);
   } catch (e) {
+    // 调用方主动取消：抛 AbortError，调用方据此静默丢弃（不算连接失败）
+    if (signal && signal.aborted) {
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
     const msg = e && e.name === 'TimeoutError' ? '请求超时（后端无响应）' : '后端未连接';
     throw new ApiError(0, msg, null);
   }
@@ -44,7 +64,8 @@ async function api(method, path, body, timeoutMs = 15000) {
   return data;
 }
 
-const apiGet = (p) => api('GET', p);
+// opts: { signal, timeoutMs } —— 会话切换等场景传入 AbortController.signal 取消在途请求
+const apiGet = (p, opts) => api('GET', p, undefined, (opts && opts.timeoutMs) || 15000, opts && opts.signal);
 const apiPost = (p, b, t) => api('POST', p, b, t);
 const apiDelete = (p) => api('DELETE', p);
 const apiPut = (p, b) => api('PUT', p, b);

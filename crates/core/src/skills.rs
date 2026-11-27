@@ -232,7 +232,7 @@ impl SkillManager {
             std::fs::create_dir_all(p)?;
         }
         let s = serde_json::to_string_pretty(state)?;
-        std::fs::write(&self.store_path, s)?;
+        crate::paths::atomic_write(&self.store_path, s)?;
         Ok(())
     }
 }

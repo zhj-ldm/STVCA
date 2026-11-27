@@ -578,11 +578,11 @@ pub async fn rebuild_agents(core: &Arc<CoreState>) {
 // 主 Agent 会话轮
 // ============================================================
 
-/// 等待主 Agent 收到中断信号；20ms 轮询，保证点停止后立即生效。
-/// 用 swap 消费信号：中断只作用于当前轮，不会残留到下一轮把新任务误杀。
-async fn wait_for_interrupt(core: &Arc<CoreState>) {
+/// 等待本轮（gen）收到中断信号；20ms 轮询，保证点停止后立即生效。
+/// 打断按轮次代号匹配：残留的旧信号不会误杀新任务，也无需消费清除。
+async fn wait_for_interrupt(core: &Arc<CoreState>, gen: u64) {
     loop {
-        if core.interrupt_main.swap(false, Ordering::SeqCst) {
+        if core.is_main_interrupted(gen) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -595,7 +595,18 @@ pub async fn run_main_turn(
     session_id: Option<String>,
     is_report: bool,
 ) {
+    // 原子抢占：并发请求（HTTP/唤醒/定时/子 Agent 汇报）只有一个能进入。
+    // 抢不到说明已有轮次在跑，发 TurnFailed 让前端收尾乐观状态。
+    let Some(my_gen) = core.try_acquire_main() else {
+        core.emit(Event::TurnFailed {
+            session_id: session_id.unwrap_or_default(),
+            message: "主 Agent 正在处理中，可点击停止或语音说 stop 打断".into(),
+            retryable: true,
+        });
+        return;
+    };
     if let Err(e) = ensure_agents(&core).await {
+        core.main_busy.store(false, Ordering::SeqCst);
         core.emit(Event::AssistantDone {
             session_id: String::new(),
             text: format!("主 Agent 未就绪：{e}"),
@@ -616,10 +627,9 @@ pub async fn run_main_turn(
         };
         sid.expect("session id")
     };
-    core.main_busy.store(true, Ordering::SeqCst);
-    // 消费启动前已到达的打断（用户在 spawn 间隙点了停止）：本轮直接按被打断收尾，
-    // 而不是把信号清掉让停止按钮"点了没反应"。
-    let pre_interrupted = core.interrupt_main.swap(false, Ordering::SeqCst);
+    // 抢占后立刻到达的打断（用户在 spawn 间隙点了停止）也要生效：
+    // 代号匹配才成立，旧轮次残留的信号不会命中本轮。
+    let pre_interrupted = core.is_main_interrupted(my_gen);
     *core.turn_session.lock().await = Some(sid.clone());
     core.set_main_status("working");
     // 本轮墙钟计时起点：用于"已完成，用时 X 分 X 秒"（含思考与工具全过程）
@@ -733,7 +743,11 @@ pub async fn run_main_turn(
                 .to_string_lossy()
                 .into_owned()
         });
-        let _ = core.voice.beep(Some(&file)).await;
+        // 提示音后台播放，不阻塞首字节请求（beep 服务异常时最多拖 60 秒）
+        let beep_core = core.clone();
+        tokio::spawn(async move {
+            beep_audible(&beep_core, Some(&file)).await;
+        });
     }
 
     // 进入内置 Agent 循环（唯一后端）。
@@ -744,6 +758,11 @@ pub async fn run_main_turn(
             core.main_busy.store(false, Ordering::SeqCst);
             *core.turn_session.lock().await = None;
             core.set_main_status("idle");
+            core.emit(Event::TurnFailed {
+                session_id: sid.clone(),
+                message: "主 Agent 未初始化，请先在设置中完成模型配置".into(),
+                retryable: true,
+            });
             return;
         }
     };
@@ -752,7 +771,7 @@ pub async fn run_main_turn(
     let mut messages = history;
     messages.push(user_msg(&user_text));
 
-    let cancel = CancellationToken::new();
+    let mut cancel = CancellationToken::new();
     let mut final_text = String::new();
     let mut interrupted = pre_interrupted;
     let mut reached_max = false;
@@ -760,11 +779,15 @@ pub async fn run_main_turn(
     let max_turns = agent.max_turns;
     // 上游截断或只思考不产出时的续跑次数，避免静默结束。
     let mut stall_retries = 0u32;
+    // 上游请求失败时切换下一个 key/线路重试一次（多线路才有的兜底）
+    let mut failover_used = false;
+    // 本轮以失败收尾：不做自动语音播报（错误文本念出来没有意义）
+    let mut failed = false;
 
     // 自管循环：请求（常驻+已加载工具）→ 流式解析 → 执行工具 → 回填 → 继续。
     // 渐进式加载的关键：每轮重新收集工具集，ToolGuide 启用的工具下一轮即可见。
     for turn in 0..max_turns {
-        if interrupted || core.interrupt_main.swap(false, Ordering::SeqCst) {
+        if interrupted || core.is_main_interrupted(my_gen) {
             interrupted = true;
             cancel.cancel();
             break;
@@ -778,7 +801,7 @@ pub async fn run_main_turn(
         let ch = &agent.channels[agent.cursor.fetch_add(1, Ordering::SeqCst) % agent.channels.len()];
         // 等上游限流槽位时也要能被打断，否则退避期间点停止会一直没反应。
         tokio::select! {
-            _ = wait_for_interrupt(&core) => {
+            _ = wait_for_interrupt(&core, my_gen) => {
                 interrupted = true;
                 cancel.cancel();
                 break;
@@ -793,13 +816,17 @@ pub async fn run_main_turn(
             ..Default::default()
         };
         // 建立连接、等首字节同样属于「还没开始流式」，这里也要能瞬间中断。
-        let mut stream = tokio::select! {
-            _ = wait_for_interrupt(&core) => {
+        // 连接建立同样限 45s：上游不可达时 reqwest 总超时 600s，不能让任务挂那么久。
+        let stream_res = tokio::select! {
+            _ = wait_for_interrupt(&core, my_gen) => {
                 interrupted = true;
                 cancel.cancel();
                 break;
             }
-            s = ch.provider.stream_simple(&agent.model, &ctx, &opts) => s,
+            s = tokio::time::timeout(
+                Duration::from_secs(45),
+                ch.provider.stream_simple(&agent.model, &ctx, &opts),
+            ) => s,
         };
 
         let mut round_text = String::new();
@@ -807,17 +834,43 @@ pub async fn run_main_turn(
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut assistant: Option<AssistantMessage> = None;
         let mut failure: Option<String> = None;
+        // None = 连接超时：跳过流式循环，直接走下面的失败处理（可换线路重试）
+        let mut stream = stream_res.ok();
+        if stream.is_none() {
+            failure = Some("连接模型超时（45 秒无响应）".into());
+        }
+        // 首内容看门狗：连接挂死/上游黑洞时 SDK 的 600s 总超时太长，
+        // 45 秒没有任何实质事件就按失败处理（可触发换线路重试）。
+        let mut got_content = false;
+        let first_content_deadline = tokio::time::Instant::now() + Duration::from_secs(45);
 
-        loop {
+        while stream.is_some() {
             tokio::select! {
+                _ = tokio::time::sleep_until(first_content_deadline), if !got_content => {
+                    failure = Some("模型 45 秒未返回任何内容（上游无响应）".into());
+                    cancel.cancel();
+                    break;
+                }
                 _ = tokio::time::sleep(Duration::from_millis(30)) => {
-                    if core.interrupt_main.swap(false, Ordering::SeqCst) {
+                    if core.is_main_interrupted(my_gen) {
                         interrupted = true;
                         cancel.cancel();
                         break;
                     }
                 }
-                ev = stream.next() => {
+                ev = stream.as_mut().unwrap().next() => {
+                    if matches!(
+                        ev,
+                        Some(
+                            AssistantMessageEvent::TextDelta { .. }
+                                | AssistantMessageEvent::ThinkingDelta { .. }
+                                | AssistantMessageEvent::ToolCallEnd { .. }
+                                | AssistantMessageEvent::Done { .. }
+                                | AssistantMessageEvent::Error { .. }
+                        )
+                    ) {
+                        got_content = true;
+                    }
                     match ev {
                         Some(AssistantMessageEvent::TextDelta { delta, .. }) => {
                             if !delta.is_empty() {
@@ -926,9 +979,22 @@ pub async fn run_main_turn(
             break;
         }
         if let Some(err) = failure {
+            // 多 key/多线路配置下换下一条线路重试一次（cursor 轮转自然切换），
+            // 单线路时 SDK 内部已重试过，不再原地重复。
+            if !failover_used && agent.channels.len() > 1 {
+                failover_used = true;
+                cancel = CancellationToken::new();
+                core.emit(Event::AssistantText {
+                    session_id: sid.clone(),
+                    text: format!("\n[线路异常] {err}，正在切换备用线路重试…"),
+                });
+                continue;
+            }
+            failed = true;
             core.emit(Event::TurnFailed {
                 session_id: sid.clone(),
                 message: err.clone(),
+                retryable: true,
             });
             core.emit(Event::AssistantText {
                 session_id: sid.clone(),
@@ -1019,7 +1085,7 @@ pub async fn run_main_turn(
                     );
                     tokio::pin!(exec);
                     tokio::select! {
-                        _ = wait_for_interrupt(&core) => {
+                        _ = wait_for_interrupt(&core, my_gen) => {
                             interrupted = true;
                             cancel.cancel();
                             match tokio::time::timeout(Duration::from_secs(3), &mut exec).await {
@@ -1137,9 +1203,9 @@ pub async fn run_main_turn(
     core.set_main_status("idle");
 
     // 自动语音播报：轮结束后由 core 直接播报最终文本，不依赖 AI 调用语音工具。
-    // 被打断的一轮不播报；TTS 在 auto_announce 内部异步执行，不阻塞返回。
-    if !interrupted {
-        auto_announce(core.clone(), final_text.clone()).await;
+    // 被打断/失败的一轮不播报；TTS 在 auto_announce 内部异步执行，不阻塞返回。
+    if !interrupted && !failed {
+        auto_announce(core.clone(), final_text.clone(), my_gen).await;
     }
 }
 
@@ -1250,14 +1316,34 @@ pub(crate) fn system_mute(muted: bool) {
         .output();
 }
 
-/// 静音状态下录制一轮用户语音：进入即静音，录音结束（无论成功失败）即恢复。
+/// 播提示音（打断音/已发送音等）：若系统此刻正被本 App 静音（旧回音方案的录音
+/// 静音窗口、AskUser 录音窗口），先恢复输出再播，否则提示音会被自己的静音吞掉。
+/// 只解除、不复位静音：静音窗口的收尾由录音侧 Drop guard 负责（幂等再恢复一次），
+/// 这里若播完重新静音，会与录音结束并发竞争，把系统留在静音态。
+/// 能走到这里的重叠场景（打断/插话）都伴随本轮取消，录音窗口随即收尾，不会长时间开麦。
+pub(crate) async fn beep_audible(core: &Arc<CoreState>, path: Option<&str>) {
+    if matches!(MUTE_MARKER.get(), Some(p) if p.exists()) {
+        system_mute(false);
+    }
+    let _ = core.voice.beep(path).await;
+}
+
+/// 录制一轮唤醒后的用户语音。默认走旧方案：进入即 osascript 整机静音防回采，
+/// 录音结束（无论成功失败）即恢复；配置 voice_system_mute=false 可切换到
+/// 软件回音门（AI/提示音播放期间丢弃麦克风帧，不改系统音量）。
 /// 说完后的静默阈值取 silence_limit_secs（默认 1.5s）；
 /// 压根没人说话时最多等 no_speech_timeout_secs（默认 4s）就结束、回到监听。
 async fn listen_once_muted(core: Arc<CoreState>, max_secs: f64) -> Result<String, anyhow::Error> {
-    let (silence_secs, no_speech_secs) = {
+    let (silence_secs, no_speech_secs, use_system_mute) = {
         let c = core.config.lock().await;
-        (c.silence_limit_secs, c.no_speech_timeout_secs)
+        (c.silence_limit_secs, c.no_speech_timeout_secs, c.voice_system_mute)
     };
+    if !use_system_mute {
+        return core
+            .voice
+            .listen_once_gated(max_secs, silence_secs, no_speech_secs)
+            .await;
+    }
     system_mute(true);
     // 用 Drop guard 恢复：即使本轮被取消/超时提前返回，也不会把系统留在静音状态。
     struct RestoreOnDrop;
@@ -1306,6 +1392,7 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
             .to_string_lossy()
             .into_owned();
         let max_record = cfg.max_record_secs;
+        let use_system_mute = cfg.voice_system_mute;
         drop(cfg);
 
         core.emit(Event::Voice {
@@ -1320,17 +1407,15 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
             // AI 工作/播报中喊 computer：只播打断音，不播唤醒音（否则两声混乱）。
             // 不录音接话；AI 停下回到监听后可再喊 computer 接新指令。
             let _ = core.voice.interrupt().await;
-            // 只有确实有轮次在跑才置打断标志：仅播报（无轮次）时置位会残留，
-            // 把用户的下一个新任务误杀。
-            if main_busy {
-                core.interrupt_main.store(true, Ordering::SeqCst);
-            }
+            // 按轮次代号记录打断：仅播报（无轮次）时不记录，
+            // 不会把用户的下一个新任务误杀。
+            core.request_interrupt();
             let beep_path = crate::paths::resource("computerbeep_75.mp3")
                 .to_string_lossy()
                 .into_owned();
-            let v = core.voice.clone();
+            let c = core.clone();
             tokio::spawn(async move {
-                let _ = v.beep(Some(&beep_path)).await;
+                beep_audible(&c, Some(&beep_path)).await;
             });
             core.emit(Event::Voice {
                 kind: "stt".into(),
@@ -1339,10 +1424,22 @@ pub async fn handle_wakeword(core: Arc<CoreState>, keyword: String) {
             return;
         }
 
-        // 空闲：先播唤醒提示音（等播完，避免被录音静音吞掉）再录音
+        // 空闲：播唤醒提示音并开始录音。
+        // 软件回音门下提示音与录音并行（播放期麦克风帧被丢弃，不会回采），
+        // 用户听到提示音即可开口，不再等提示音播完的空窗。
+        // 回滚模式（整机静音）必须等播完再静音，否则提示音被自己吞掉。
         let voice_sid = core.voice_session.lock().await.clone();
-        if let Err(e) = core.voice.beep(Some(&beep)).await {
-            tracing::warn!("唤醒提示音播放失败: {e}");
+        if use_system_mute {
+            if let Err(e) = core.voice.beep(Some(&beep)).await {
+                tracing::warn!("唤醒提示音播放失败: {e}");
+            }
+        } else {
+            let v = core.voice.clone();
+            tokio::spawn(async move {
+                if let Err(e) = v.beep(Some(&beep)).await {
+                    tracing::warn!("唤醒提示音播放失败: {e}");
+                }
+            });
         }
         core.emit(Event::Voice {
             kind: "recording".into(),
@@ -1448,6 +1545,48 @@ pub fn compose_system_prompt(cfg: &Config, skills_text: &str, memory_text: &str)
 - 派发后立即用一句话告知用户，并继续处理其他可同步进行的工作；没有其他任务时回复「请稍等」类提示。\n\
 - 用户询问进度时调用 ListSubagents；用户要求停止/打断时调用 CancelSubagent。\n\
 - 子 Agent 完成会自动以独立卡片通知用户并语音播报，你无需长篇复述其结果。"
+            .to_string(),
+    );
+    let persona = cfg.main_system_prompt.trim();
+    if !persona.is_empty() {
+        parts.push(format!("=== 个人设定（用户配置的人设） ===\n{persona}"));
+    }
+    let skills = skills_text.trim();
+    if !skills.is_empty() && !skills.starts_with("（暂无") {
+        parts.push(format!("=== 可用 Skills ===\n{skills}"));
+    }
+    let memory = memory_text.trim();
+    if !memory.is_empty() && !memory.starts_with("（暂无") {
+        parts.push(format!("=== 长期记忆 ===\n{memory}"));
+    }
+    parts.join("\n\n")
+}
+
+/// 子 Agent 系统提示词：与主 Agent 共用语言指令、核心规则、人设、Skills 目录与长期记忆，
+/// 只把「派发子 Agent」一节替换为后台执行规则（无用户在场、无语音/交付/子 Agent 工具）。
+pub fn compose_child_system_prompt(cfg: &Config, skills_text: &str, memory_text: &str) -> String {
+    // 子 Agent 没有 AskUser / 语音播报 / DeliverFiles 能力：去掉对应章节，
+    // 避免模型按"必须"规则调用未注册的工具或输出无意义的播报段。
+    let mut rules = load_system_rules();
+    for heading in [
+        "## 3. 主动询问用户",
+        "## 4. 语音播报（强制格式）",
+        "## 7. 主动交付（交付卡片）",
+    ] {
+        rules = strip_section(&rules, heading);
+    }
+    let mut parts: Vec<String> = vec![language_directive(&cfg.output_language)];
+    parts.push(format!(
+        "=== 核心行为规则（系统级，优先于下面的个人设定） ===\n{}",
+        rules.trim()
+    ));
+    parts.push(
+        "=== 子 Agent（后台任务） ===\n\
+你是由主 Agent 派发的后台子 Agent，独立完成一项具体任务。\n\
+- 直接动手执行：用户不在一旁，不要提问；不要输出【Voice】播报段，也不要调用语音/交付卡片/子 Agent 能力。\n\
+- 优先用工具核实事实，文件路径一律使用绝对路径；可用能力与主 Agent 一致（文件、命令、联网搜索、Skills、MCP 连接器）。\n\
+- 任务完成后，用不超过 120 字的摘要给出结果：关键结论、产出文件路径、遗留问题（语言遵循系统语言规则）。\n\
+- 如果任务无法完成，直接说明原因和已尝试的步骤，不要编造结果。"
             .to_string(),
     );
     let persona = cfg.main_system_prompt.trim();
@@ -1630,7 +1769,7 @@ async fn play_continuous_effect(core: Arc<CoreState>) {
         }
     });
     if let Some(p) = path {
-        let _ = core.voice.beep(Some(&p)).await;
+        beep_audible(&core, Some(&p)).await;
     }
 }
 
@@ -1705,9 +1844,7 @@ pub async fn continuous_session(core: Arc<CoreState>, sid: Option<String>, play_
                 //    让新指令立即接管（"AI 工作中插话有反应"的关键）。
                 if core.main_busy.load(Ordering::SeqCst) || core.speaking.load(Ordering::SeqCst) {
                     let _ = core.voice.interrupt().await;
-                    if core.main_busy.load(Ordering::SeqCst) {
-                        core.interrupt_main.store(true, Ordering::SeqCst);
-                    }
+                    core.request_interrupt();
                     core.emit(Event::Voice {
                         kind: "continuous".into(),
                         text: "interrupt".into(),
@@ -1747,9 +1884,7 @@ pub async fn continuous_session(core: Arc<CoreState>, sid: Option<String>, play_
     }
     core.continuous_active.store(false, Ordering::SeqCst);
     // 退出时若还有轮次在跑，一并打断，避免"模式已退出但 AI 还在播报"
-    if core.main_busy.load(Ordering::SeqCst) {
-        core.interrupt_main.store(true, Ordering::SeqCst);
-    }
+    core.request_interrupt();
     let _ = core.voice.interrupt().await;
     // 结束音效（与开启音效同一个）
     play_continuous_effect(core.clone()).await;

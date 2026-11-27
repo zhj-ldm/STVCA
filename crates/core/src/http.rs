@@ -89,6 +89,7 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/voice/continuous", post(voice_continuous))
         .route("/api/voice/interrupt", post(voice_interrupt))
         .route("/api/config", get(get_config).post(save_config))
+        .route("/api/models/probe", post(probe_models))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/import", post(import_skill))
         .route("/api/skills/:name", delete(remove_skill))
@@ -137,7 +138,12 @@ async fn health() -> &'static str {
 }
 
 async fn status(State(core): State<SharedState>) -> Json<Value> {
-    let cfg = core.config.lock().await;
+    // 先取出所需配置字段再释放锁：voice.health/status 是网络调用（秒级超时），
+    // 持配置锁跨 await 会把保存配置等所有拿锁请求一起卡死。
+    let (voice_enabled, voice_port, wakeword) = {
+        let cfg = core.config.lock().await;
+        (cfg.voice_enabled, cfg.voice_port, cfg.wakeword.clone())
+    };
     let voice_connected = core.voice.health().await;
     // voice-serve 语音链路诊断（麦克风权限 / 采集 / KWS 模型）
     let mut voice_diag = serde_json::Map::new();
@@ -158,9 +164,9 @@ async fn status(State(core): State<SharedState>) -> Json<Value> {
         "continuous_active": core.continuous_active.load(Ordering::SeqCst),
         "agents_ready": core.agents_ready.load(Ordering::SeqCst),
         "voice_connected": voice_connected,
-        "voice_enabled": cfg.voice_enabled,
-        "voice_port": cfg.voice_port,
-        "wakeword": cfg.wakeword,
+        "voice_enabled": voice_enabled,
+        "voice_port": voice_port,
+        "wakeword": wakeword,
         "mic_alive": voice_diag.get("mic_alive").and_then(|v| v.as_bool()).unwrap_or(false),
         "voice_diag": serde_json::Value::Object(voice_diag),
     });
@@ -270,10 +276,8 @@ async fn chat(State(core): State<SharedState>, Json(req): Json<ChatReq>) -> Json
 }
 
 async fn chat_interrupt(State(core): State<SharedState>) -> Json<Value> {
-    // 只有确实有轮次在跑才置打断标志：空闲时置位会残留，误杀下一个新任务
-    if core.main_busy.load(Ordering::SeqCst) {
-        core.interrupt_main.store(true, Ordering::SeqCst);
-    }
+    // 按轮次代号记录打断：空闲时不残留，也不会误杀刚开始的新任务
+    core.request_interrupt();
     let _ = core.voice.interrupt().await;
     Json(json!({"ok": true}))
 }
@@ -537,14 +541,25 @@ async fn voice_listening(
     // 持久化监听状态：重启 App 后 core 重新拉起 voice-serve 时据此恢复，
     // 避免"已开启监听但重启后按钮颜色不恢复 / 监听静默丢失"。
     if ok {
-        let data_dir = core.config.lock().await.data_dir.clone();
+        let mut cfg = core.config.lock().await;
+        // 手动开启监听 = 明确要用语音：总开关若关着则一并打开并落盘。
+        // 否则唤醒回调会被 handle_wakeword 的 voice_enabled 检查静默丢弃，
+        // 表现为"按钮绿了、喊 computer 毫无反应"。
+        if req.enabled && !cfg.voice_enabled {
+            cfg.voice_enabled = true;
+            if let Err(e) = cfg.save(&core.config_path) {
+                tracing::warn!("开启监听时回写 voice_enabled 失败: {e}");
+            }
+        }
+        let data_dir = cfg.data_dir.clone();
+        drop(cfg);
         let path = data_dir.join("voice-state.json");
         let state = serde_json::json!({
             "listening": req.enabled,
             "session_id": session_id,
         });
         if let Ok(s) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(&path, s);
+            let _ = crate::paths::atomic_write(&path, s);
         }
     }
     Json(json!({"ok": ok}))
@@ -574,7 +589,7 @@ async fn voice_session(
     if let Ok(s) = serde_json::to_string_pretty(
         &json!({ "listening": listening, "session_id": req.session_id }),
     ) {
-        let _ = std::fs::write(&path, s);
+        let _ = crate::paths::atomic_write(&path, s);
     }
     Json(json!({"ok": true}))
 }
@@ -621,6 +636,86 @@ async fn voice_continuous(
 
 // ---------- 配置 ----------
 
+#[derive(Deserialize)]
+struct ProbeModelsReq {
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
+}
+
+/// 探测上游可用模型：GET {base}/v1/models（OpenAI 兼容列表接口）。
+/// 由后端代发，避开渲染进程跨域限制，Key 也不暴露给页面网络层。
+async fn probe_models(Json(req): Json<ProbeModelsReq>) -> Json<Value> {
+    let base = crate::config::normalize_base_url(&req.base_url);
+    if base.is_empty() {
+        return Json(json!({"ok": false, "error": "请先填写 API 地址"}));
+    }
+    let last = base.rsplit('/').next().unwrap_or("");
+    let versioned = last.len() > 1
+        && last.starts_with('v')
+        && last[1..].chars().all(|c| c.is_ascii_digit());
+    let url = if versioned {
+        format!("{base}/models")
+    } else {
+        format!("{base}/v1/models")
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Json(json!({"ok": false, "error": format!("HTTP 客户端初始化失败: {e}")})),
+    };
+    let mut rb = client.get(&url);
+    let key = req.api_key.trim();
+    if !key.is_empty() {
+        rb = rb.bearer_auth(key);
+    }
+    let resp = match rb.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = if e.is_timeout() {
+                "连接超时（12 秒无响应），请检查地址是否正确、网络是否可达".to_string()
+            } else if e.is_connect() {
+                format!("无法连接该地址: {e}")
+            } else {
+                format!("请求失败: {e}")
+            };
+            return Json(json!({"ok": false, "error": msg}));
+        }
+    };
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Json(json!({"ok": false, "error": format!("API Key 无效或无权限（HTTP {status}）")}));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Json(json!({"ok": false, "error": "该地址不提供模型列表接口（/models 返回 404），请手动填写模型名"}));
+    }
+    if !status.is_success() {
+        return Json(json!({"ok": false, "error": format!("上游返回 HTTP {status}")}));
+    }
+    let body: Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"ok": false, "error": format!("响应不是有效 JSON: {e}")})),
+    };
+    let mut models: Vec<String> = body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|i| i.as_str()))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if models.is_empty() {
+        return Json(json!({"ok": false, "error": "响应里没有模型列表（期望 OpenAI 兼容的 {data:[{id:...}]} 格式）"}));
+    }
+    models.sort();
+    models.dedup();
+    Json(json!({"ok": true, "models": models, "url": url}))
+}
+
 async fn get_config(State(core): State<SharedState>) -> Json<Value> {
     // 以配置文件为唯一真相源：外部直接改动 config.json 后，
     // UI 刷新即可看到新值，避免内存缓存与文件不一致。
@@ -654,9 +749,23 @@ async fn save_config(
     }
     *guard = cfg.clone();
     let kws_threshold = cfg.kws_threshold;
+    let voice_enabled = cfg.voice_enabled;
+    let data_dir = cfg.data_dir.clone();
     drop(guard);
     // 同步语音客户端
     core.voice.set_base(cfg.voice_base());
+    // 设置里关闭语音 = 整条语音链路下线：停监听并落盘，
+    // 否则按钮仍绿、唤醒命中却被 voice_enabled 检查静默丢弃。
+    if !voice_enabled {
+        let vc = core.voice.clone();
+        tokio::spawn(async move {
+            let _ = vc.set_listening(false).await;
+            let state = serde_json::json!({ "listening": false, "session_id": null });
+            if let Ok(s) = serde_json::to_string_pretty(&state) {
+                let _ = crate::paths::atomic_write(&data_dir.join("voice-state.json"), s);
+            }
+        });
+    }
     // 热更新唤醒词阈值（voice-serve 未启动/失败时忽略，不影响配置保存）
     let vc = core.voice.clone();
     tokio::spawn(async move {
