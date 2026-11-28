@@ -2721,6 +2721,154 @@ function visionAvailable() {
   return !!(window.visionInfo && window.visionInfo.enabled);
 }
 
+// ---- 图片能力：真实探测 + 自动启用 ----
+// 名称启发式会漏掉未带 vision/vl 的视觉模型（如 deepseek-v4.1-flash），
+// 因此发图前用一张 1×1 PNG 向当前模型真实探测一次，通过就落盘 supports_vision=true。
+let visionProbeInflight = null;
+let visionSaveInflight = null;
+
+function visionDraftProvider() {
+  if (!modelList.length) return null;
+  const edit = $('#model-edit');
+  if (edit && edit.querySelector('.me-name')) flushModelEdit();
+  return modelList[Math.min(activeModelIdx, modelList.length - 1)] || null;
+}
+
+function visionProbePayload(m) {
+  const p = {};
+  if (!m) return p;
+  const url = normalizeProviderUrl((m.base_url || '').trim());
+  if (url) p.base_url = url;
+  if (m.api_key) p.api_key = m.api_key;
+  if (m.model) p.model = m.model;
+  return p;
+}
+
+async function persistVisionFlag(value) {
+  const m = visionDraftProvider();
+  if (!m) return false;
+  if (!(m.base_url || '').trim()) {
+    toast('请先填写 API 地址，再设置图片理解', 'error', 5000);
+    return false;
+  }
+  if (!isValidBaseUrl(m.base_url)) {
+    toast('API 地址格式无效，请修正后再设置图片理解', 'error', 5000);
+    return false;
+  }
+  if (visionSaveInflight) await visionSaveInflight.catch(() => {});
+  const run = (async () => {
+    m.supports_vision = value;
+    return saveModels();
+  })();
+  visionSaveInflight = run;
+  try { return await run; } finally { if (visionSaveInflight === run) visionSaveInflight = null; }
+}
+
+// 返回值 { supported, model, detail, transient }；transient=true 表示网络/鉴权等问题，未得出能力结论
+function probeVisionNow({ silent = false } = {}) {
+  if (visionProbeInflight) return visionProbeInflight;
+  const m = visionDraftProvider();
+  const payload = visionProbePayload(m);
+  visionProbeInflight = (async () => {
+    let r = null;
+    try {
+      r = await apiPost('/api/vision/probe', payload);
+    } catch (e) {
+      if (!silent) toast('图片能力检测失败：' + (e.message || '网络错误'), 'error', 6000);
+      return { supported: false, transient: true };
+    }
+    if (r && r.ok && r.supported) {
+      return { supported: true, model: r.model || (m && m.model) || '', detail: r.detail };
+    }
+    if (r && r.ok && !r.supported) {
+      if (!silent) {
+        toast(`检测结果：该模型不支持图片理解${r.detail ? '（' + r.detail + '）' : ''}。可在「图片理解」里强制设为「支持」后重试。`, 'warn', 7000);
+      }
+      return { supported: false, detail: r.detail };
+    }
+    if (!silent) toast('图片能力检测失败：' + ((r && r.error) || '未知错误'), 'error', 7000);
+    return { supported: false, transient: true };
+  })();
+  try {
+    return visionProbeInflight;
+  } finally {
+    // 并发调用共享同一次请求；结束后清空以便下次重新探测
+    visionProbeInflight.finally(() => { visionProbeInflight = null; });
+  }
+}
+
+async function ensureVisionForImages() {
+  if (visionAvailable()) return true;
+  const globalCb = $('#settings-form') && $('#settings-form').image_input_enabled;
+  if (globalCb && !globalCb.checked) {
+    toast('全局「启用图片输入」未勾选：请在 设置 → 模型 勾选并保存后再发图。', 'warn', 7000);
+    return false;
+  }
+  if (visionSaveInflight) {
+    await visionSaveInflight.catch(() => {});
+    if (visionAvailable()) return true;
+  }
+  const sel = document.querySelector('#model-edit .me-vision');
+  if (sel && sel.value === 'off') {
+    toast('该模型的图片理解被设为「不支持」。请在 设置 → 模型 →「图片理解」改为「支持」或「自动判断」。', 'warn', 7000);
+    return false;
+  }
+  toast('正在检测当前模型是否支持图片理解…', 'info', 2000);
+  const res = await probeVisionNow();
+  if (!res.supported) return false;
+  if (sel) sel.value = 'on';
+  const saved = await persistVisionFlag(true);
+  if (!saved) return false;
+  await refreshVisionInfo();
+  if (!visionAvailable()) {
+    toast('检测通过，但全局「启用图片输入」未勾选：请在 设置 → 模型 勾选后保存。', 'warn', 7000);
+    return false;
+  }
+  toast(`已自动检测并启用图片理解（${res.model || '当前模型'}）`, 'success', 4000);
+  return true;
+}
+
+async function onVisionProbeClick(btn) {
+  if (btn.disabled) return;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.classList.add('loading');
+  btn.textContent = '检测中…';
+  try {
+    const res = await probeVisionNow();
+    if (res.supported) {
+      const sel = document.querySelector('#model-edit .me-vision');
+      if (sel) sel.value = 'on';
+      const saved = await persistVisionFlag(true);
+      await refreshVisionInfo();
+      if (saved && visionAvailable()) {
+        toast(`检测通过：${res.model || '当前模型'} 支持图片理解，已保存启用`, 'success', 5000);
+      } else if (saved) {
+        toast('检测通过并已保存，但全局「启用图片输入」未勾选，仍无法发图', 'warn', 6000);
+      }
+    }
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('loading');
+    btn.textContent = old;
+  }
+}
+
+// 下拉选择即保存该模型的图片能力，避免"改了没保存"导致仍显示未启用
+async function onVisionSelectChange(sel) {
+  const m = modelList[Math.min(activeModelIdx, modelList.length - 1)];
+  const prev = m && m.supports_vision === true ? 'on' : m && m.supports_vision === false ? 'off' : 'auto';
+  const want = sel.value === 'on' ? true : sel.value === 'off' ? false : null;
+  const ok = await persistVisionFlag(want);
+  if (!ok) { sel.value = prev; return; }
+  await refreshVisionInfo();
+  if (want === true && !visionAvailable()) {
+    toast('已保存为支持，但全局「启用图片输入」未勾选，仍无法发送图片', 'warn', 6000);
+  } else {
+    toast(want === true ? '图片理解已启用' : want === false ? '图片理解已关闭' : '图片理解改为「自动判断」', 'success', 2500);
+  }
+}
+
 function renderChatImages() {
   const box = $('#chat-images');
   if (!box) return;
@@ -2769,8 +2917,8 @@ async function addImageFiles(fileList) {
   const files = Array.from(fileList || []).filter((f) => f && f.type && f.type.startsWith('image/'));
   if (!files.length) return;
   if (!visionAvailable()) {
-    toast('当前模型未开启图片理解：设置 → 模型 → 勾选「启用图片输入」并确认模型支持视觉', 'warn');
-    return;
+    const ok = await ensureVisionForImages();
+    if (!ok) return;
   }
   for (const f of files) {
     if (pendingImages.length >= MAX_PENDING_IMAGES) {
@@ -2809,10 +2957,12 @@ function takePendingImages() {
 }
 
 $('#btn-attach').addEventListener('click', () => {
-  if (!visionAvailable()) {
-    toast('当前模型未开启图片理解：设置 → 模型 → 勾选「启用图片输入」并确认模型支持视觉', 'warn');
+  const sel = document.querySelector('#model-edit .me-vision');
+  if (!visionAvailable() && sel && sel.value === 'off') {
+    toast('该模型的图片理解被设为「不支持」。请在 设置 → 模型 →「图片理解」改为「支持」或「自动判断」。', 'warn', 7000);
     return;
   }
+  // 未启用也直接打开选择器：选完图片后会真实探测并自动启用
   $('#chat-file').click();
 });
 $('#chat-file').addEventListener('change', (e) => {
@@ -4149,14 +4299,16 @@ function modelEditHTML(m, ordinal) {
     '<span class="me-probe-error" hidden></span>' +
     '</div>' +
     '<div class="me-field me-vision-field">' +
-    '<label class="me-field-label">图片理解' +
+    '<label class="me-field-label">图片理解</label>' +
+    '<div class="me-model-row">' +
     '<select class="me-vision">' +
     '<option value="auto">自动判断（按模型名）</option>' +
     '<option value="on">支持（强制启用）</option>' +
     '<option value="off">不支持（强制关闭）</option>' +
     '</select>' +
-    '</label>' +
-    '<p class="me-format-hint">自动模式识别常见视觉模型（gpt-4o、claude-3/4、gemini、qwen-vl、llava 等）；中转/本地模型判断不准时手动指定。</p>' +
+    '<button type="button" class="btn-mini me-probe me-vision-probe" title="发送一张 1×1 测试图，实测该模型能否理解图片">自动检测</button>' +
+    '</div>' +
+    '<p class="me-format-hint">「自动判断」按模型名识别常见视觉模型（gpt-4o、claude、gemini、qwen-vl、llava 等）；名称不含 vision/vl 的模型可能误判，点「自动检测」实测，通过即自动保存为「支持」。选择后立即保存生效。</p>' +
     '</div>' +
     '<div class="me-field me-rpm-field">' +
     '<label class="me-field-label">每个 Key 限额 RPM <input class="me-rpm" type="number" min="1" step="1" placeholder="20" /></label>' +
@@ -4255,7 +4407,10 @@ function renderModelEdit() {
   const visionSel = box.querySelector('.me-vision');
   if (visionSel) {
     visionSel.value = m.supports_vision === true ? 'on' : m.supports_vision === false ? 'off' : 'auto';
+    visionSel.addEventListener('change', () => onVisionSelectChange(visionSel));
   }
+  const visionProbeBtn = box.querySelector('.me-vision-probe');
+  if (visionProbeBtn) visionProbeBtn.addEventListener('click', () => onVisionProbeClick(visionProbeBtn));
   if (!box._keyWired) { wireKeyList(box); box._keyWired = true; }
   wireBaseUrlBox(box);
   wireProviderDropdown(box, m);
@@ -4564,9 +4719,32 @@ function updateVisionStatus() {
     el.textContent = `图片能力：已启用（${model}）——可拖拽/粘贴图片，AI 也可用 ViewImage 读图。`;
     el.style.color = 'var(--ok)';
   } else {
-    el.textContent = `图片能力：未启用（${model} 未被识别为视觉模型）。可在上方该模型配置的「图片理解」里手动设为「支持」。`;
+    const globalCb = $('#settings-form') && $('#settings-form').image_input_enabled;
+    const sel = document.querySelector('#model-edit .me-vision');
+    if (globalCb && !globalCb.checked) {
+      el.textContent = '图片能力：全局「启用图片输入」未勾选，保存勾选后才会生效。';
+    } else if (sel && sel.value === 'off') {
+      el.textContent = `图片能力：已强制关闭（${model}）。把「图片理解」改为「支持」或「自动判断」即可恢复。`;
+    } else {
+      el.textContent = `图片能力：未启用（${model} 未被识别为视觉模型）。点该模型配置里的「自动检测」实测，或把「图片理解」设为「支持」；在对话里直接拖入/粘贴图片也会自动检测并启用。`;
+    }
     el.style.color = 'var(--text-2)';
   }
+}
+
+// 全局「启用图片输入」开关：只影响保存后的配置，这里先给出即时提示
+const imageInputCb = $('#settings-form') && $('#settings-form').image_input_enabled;
+if (imageInputCb) {
+  imageInputCb.addEventListener('change', () => {
+    const el = $('#vision-status');
+    if (!el) return;
+    if (!imageInputCb.checked) {
+      el.textContent = '图片能力：全局「启用图片输入」已取消勾选（保存设置后生效）';
+      el.style.color = 'var(--text-2)';
+    } else {
+      updateVisionStatus();
+    }
+  });
 }
 
 // 模型/配置变更后刷新图片能力（后端按当前 active provider + 名称启发式计算）

@@ -1703,6 +1703,8 @@ body.theme-lcars .sa-card__title { color: #fc9; }
   background: var(--bg-3); padding: 1px 5px; border-radius: 4px; color: var(--text);
 }
 .me-model-row { display: flex; align-items: center; gap: 8px; }
+.me-vision-field .me-model-row { max-width: 420px; }
+.me-vision { flex: 1; min-width: 0; }
 .me-model-dd { flex: 1; min-width: 0; }
 .me-model-dd .dd-trigger { padding: 8px 10px; }
 .me-probe { flex: none; white-space: nowrap; border-color: var(--accent, #2f6fed); color: var(--accent, #2f6fed); }

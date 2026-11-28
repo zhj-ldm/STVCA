@@ -102,6 +102,7 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/memory/clear", post(clear_memory))
         .route("/api/memory/:id", delete(remove_memory).put(update_memory))
         .route("/api/system-prompt/preview", get(system_prompt_preview))
+        .route("/api/vision/probe", post(probe_vision))
         .route("/api/schedules", get(list_schedules).post(add_schedule))
         .route(
             "/api/schedules/:id",
@@ -349,7 +350,7 @@ async fn chat(State(core): State<SharedState>, Json(req): Json<ChatReq>) -> Json
         if !vision {
             return Json(json!({
                 "ok": false,
-                "error": "当前模型未开启图片理解。请在 设置 → 模型 → 「启用图片输入」并确认模型支持视觉（或手动设为支持）。"
+                "error": "当前模型未开启图片理解。请在 设置 → 模型 → 「图片理解」设为「支持」或「自动」，也可在对话里点图片按钮自动检测。"
             }));
         }
     }
@@ -805,6 +806,156 @@ async fn probe_models(Json(req): Json<ProbeModelsReq>) -> Json<Value> {
     models.sort();
     models.dedup();
     Json(json!({"ok": true, "models": models, "url": url}))
+}
+
+// ---------- 图片能力探测 ----------
+
+/// 1×1 的白色 PNG：只用来让上游解析一张合法的 image_url。
+const PROBE_IMAGE_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+#[derive(Deserialize, Default)]
+struct VisionProbeReq {
+    /// 以下字段可覆盖当前生效配置（用于检测尚未保存的表单值）
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+fn chat_completions_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/chat/completions") {
+        return base.to_string();
+    }
+    let last = base.rsplit('/').next().unwrap_or("");
+    let versioned = last.len() > 1
+        && last.starts_with('v')
+        && last[1..].chars().all(|c| c.is_ascii_digit());
+    if versioned {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    }
+}
+
+fn error_detail(body: &str) -> String {
+    let parsed: Option<Value> = serde_json::from_str(body).ok();
+    let msg = parsed.and_then(|v| {
+        v.get("error")
+            .and_then(|e| e.get("message").or(Some(e)))
+            .or_else(|| v.get("message"))
+            .and_then(|m| m.as_str().map(str::to_string))
+    });
+    let s = msg.unwrap_or_else(|| body.trim().to_string());
+    let s: String = s.chars().take(240).collect();
+    if s.is_empty() { "（上游未返回错误详情）".into() } else { s }
+}
+
+/// 真实探测当前模型能否接收图片：发一张 1×1 PNG，按上游是否接受来判断。
+/// 名称启发式会漏掉未带 vision/vl 的视觉模型（如 deepseek-v4.1-flash），这里以实际请求为准。
+async fn probe_vision(State(core): State<SharedState>, Json(req): Json<VisionProbeReq>) -> Json<Value> {
+    let (base, key, model) = {
+        let cfg = core.config.lock().await;
+        let provider = cfg.active_provider();
+        let non_empty = |s: &str| !s.trim().is_empty();
+        let base = req
+            .base_url
+            .clone()
+            .filter(|s| non_empty(s))
+            .or_else(|| provider.map(|p| p.base_url.clone()))
+            .unwrap_or_else(|| cfg.main_base_url.clone());
+        let key = req
+            .api_key
+            .clone()
+            .filter(|s| non_empty(s))
+            .or_else(|| {
+                provider.map(|p| {
+                    if non_empty(&p.api_key) {
+                        p.api_key.clone()
+                    } else {
+                        p.api_keys.first().cloned().unwrap_or_default()
+                    }
+                })
+            })
+            .unwrap_or_else(|| cfg.main_api_key.clone());
+        let model = req
+            .model
+            .clone()
+            .filter(|s| non_empty(s))
+            .unwrap_or_else(|| cfg.effective_model());
+        (base, key, model)
+    };
+    let base = crate::config::normalize_base_url(&base);
+    if base.is_empty() {
+        return Json(json!({"ok": false, "error": "请先填写 API 地址"}));
+    }
+    if model.trim().is_empty() {
+        return Json(json!({"ok": false, "error": "请先填写模型名"}));
+    }
+    let url = chat_completions_url(&base);
+    let body = json!({
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "Reply with the single word OK." },
+                { "type": "image_url", "image_url": { "url": format!("data:image/png;base64,{PROBE_IMAGE_PNG}") } }
+            ]
+        }],
+        "max_tokens": 8,
+        "temperature": 0,
+        "stream": false
+    });
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(25))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Json(json!({"ok": false, "error": format!("HTTP 客户端初始化失败: {e}")})),
+    };
+    let mut rb = client.post(&url).json(&body);
+    if !key.trim().is_empty() {
+        rb = rb.bearer_auth(key.trim());
+    }
+    let resp = match rb.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = if e.is_timeout() {
+                "连接超时（25 秒无响应）".to_string()
+            } else if e.is_connect() {
+                format!("无法连接该地址: {e}")
+            } else {
+                format!("请求失败: {e}")
+            };
+            return Json(json!({"ok": false, "error": msg}));
+        }
+    };
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let code = status.as_u16();
+    if status.is_success() {
+        return Json(json!({
+            "ok": true,
+            "supported": true,
+            "model": model,
+            "detail": "上游接受了图片输入",
+        }));
+    }
+    if code == 401 || code == 403 {
+        return Json(json!({"ok": false, "error": format!("鉴权失败（HTTP {code}）：{}", error_detail(&text))}));
+    }
+    if matches!(code, 400 | 413 | 415 | 422) {
+        return Json(json!({
+            "ok": true,
+            "supported": false,
+            "model": model,
+            "status": code,
+            "detail": error_detail(&text),
+        }));
+    }
+    Json(json!({"ok": false, "error": format!("上游返回 HTTP {code}：{}", error_detail(&text))}))
 }
 
 fn config_json(cfg: &crate::config::Config) -> Value {
