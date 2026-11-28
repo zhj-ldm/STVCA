@@ -10,8 +10,8 @@ use crate::state::CoreState;
 use async_trait::async_trait;
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::error::AgentError;
-use rpi_agent::types::{AgentToolResult, ToolResultPartial};
-use rpi_ai::types::{Schema, Tool};
+use rpi_agent::types::{AgentToolResult, TextContentOrImage, ToolResultPartial};
+use rpi_ai::types::{ImageContent, Schema, Tool};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -42,9 +42,12 @@ pub(crate) fn child_tools(core: &Arc<CoreState>) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(GrepTool),
         Arc::new(FindTool),
         Arc::new(CurlTool),
-        // 与主 Agent 同源的扩展能力：安装 Skills、连接 MCP 服务
+        // 与主 Agent 同源的扩展能力：安装 Skills、连接 MCP 服务、查看图片、按需读取记忆
         Arc::new(ImportSkill::new(core.clone())),
         Arc::new(ConnectMcp::new(core.clone())),
+        Arc::new(MemoryGuide::new(core.clone())),
+        Arc::new(SaveMemory::new(core.clone())),
+        Arc::new(ViewImage::new(core.clone())),
     ]
 }
 
@@ -1292,4 +1295,350 @@ impl AgentTool for AskUserTool {
 fn system_mute(muted: bool) {
     // 统一走 agents 里的实现，确保静音标记与启动恢复逻辑只有一份。
     crate::agents::system_mute(muted);
+}
+
+// ============================================================
+// 记忆工具：MemoryGuide（按需读取）/ SaveMemory（主动沉淀）
+// ============================================================
+
+/// 读取「按需加载」的记忆。系统提示词里只给类型+标题+id 索引，
+/// 需要细节时由模型调用本工具取全文（与 ToolGuide 的渐进式思路一致）。
+pub struct MemoryGuide {
+    core: Arc<CoreState>,
+    schema: Tool,
+}
+
+impl MemoryGuide {
+    pub fn new(core: Arc<CoreState>) -> Self {
+        let schema = make_tool(
+            "MemoryGuide",
+            "读取按需加载的长期记忆。系统提示词里只列出这些记忆的类型、标题和 id；\
+需要具体内容时用 action=\"read\" 传 id（或标题），不确定关键词时用 action=\"search\"，\
+想看全部按需记忆时用 action=\"list\"。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["read", "search", "list"],
+                        "description": "read=按 id/标题读取；search=按关键词搜索；list=列出全部按需记忆"
+                    },
+                    "id": { "type": "string", "description": "action=read 时的记忆 id 或完整标题" },
+                    "query": { "type": "string", "description": "action=search 时的关键词" }
+                },
+                "additionalProperties": false
+            }),
+        );
+        Self { core, schema }
+    }
+}
+
+fn format_memory_entry(e: &crate::memory::MemoryEntry) -> String {
+    format!(
+        "【{}】{}\nid: {}\n投递方式: {}\n创建时间: {}\n{}",
+        e.memory_type,
+        e.title,
+        e.id,
+        if e.mode == crate::memory::MEMORY_MODE_ON_DEMAND { "按需加载" } else { "系统提示词直连" },
+        e.created_at,
+        e.content
+    )
+}
+
+#[async_trait]
+impl AgentTool for MemoryGuide {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "MemoryGuide"
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: Value,
+        _signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
+        let action = str_of(&params, "action", "read");
+        match action.trim() {
+            "list" => {
+                let list = self.core.memory.on_demand().await;
+                if list.is_empty() {
+                    return Ok(AgentToolResult::text("没有按需加载的记忆（全部记忆已直连或记忆为空）。"));
+                }
+                let lines: Vec<String> = list
+                    .iter()
+                    .map(|e| {
+                        let preview: String = e.content.chars().take(80).collect();
+                        format!("- [{}] {}（id: {}）\n  预览：{}", e.memory_type, e.title, e.id, preview)
+                    })
+                    .collect();
+                Ok(AgentToolResult::text(format!(
+                    "按需加载的记忆（{} 条）：\n{}",
+                    list.len(),
+                    lines.join("\n")
+                )))
+            }
+            "search" => {
+                let query = str_of(&params, "query", "");
+                if query.trim().is_empty() {
+                    return Err(AgentError::tool("search 需要 query 参数"));
+                }
+                let list = self.core.memory.search(&query).await;
+                if list.is_empty() {
+                    return Ok(AgentToolResult::text(format!("没有找到包含「{query}」的记忆。")));
+                }
+                let body = list
+                    .iter()
+                    .map(format_memory_entry)
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                Ok(AgentToolResult::text(format!(
+                    "搜索「{query}」命中 {} 条：\n\n{body}",
+                    list.len()
+                )))
+            }
+            _ => {
+                let key = str_of(&params, "id", "");
+                let key = if key.trim().is_empty() { str_of(&params, "query", "") } else { key };
+                match self.core.memory.find(&key).await {
+                    Some(e) => Ok(AgentToolResult::text(format_memory_entry(&e))),
+                    None => Err(AgentError::tool(format!(
+                        "没有找到记忆「{}」。可先调用 MemoryGuide（action=\"list\"）查看可用 id。",
+                        key
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+/// 让 AI 在对话中主动沉淀长期记忆（默认按需加载，避免系统提示词无限制膨胀）。
+pub struct SaveMemory {
+    core: Arc<CoreState>,
+    schema: Tool,
+}
+
+impl SaveMemory {
+    pub fn new(core: Arc<CoreState>) -> Self {
+        let schema = make_tool(
+            "SaveMemory",
+            "保存一条长期记忆（跨会话保留）。仅在用户明确要求记住，或信息确实会长期有用时调用；\
+不要保存一次性的临时内容。mode=on_demand（默认）只在系统提示词里留索引，需要时经 MemoryGuide 读取；\
+mode=system 会直接进入系统提示词，请只对极高频、极重要的少量条目使用。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["knowledge", "preference", "gotcha", "narrative", "workflow"],
+                        "description": "记忆类型"
+                    },
+                    "title": { "type": "string", "description": "简短标题（同一主题重复保存会更新原条目）" },
+                    "content": { "type": "string", "description": "完整内容（自成一体，脱离对话也能看懂）" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["on_demand", "system"],
+                        "description": "投递方式，默认 on_demand"
+                    }
+                },
+                "required": ["title", "content"],
+                "additionalProperties": false
+            }),
+        );
+        Self { core, schema }
+    }
+}
+
+#[async_trait]
+impl AgentTool for SaveMemory {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "SaveMemory"
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: Value,
+        _signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
+        let memory_type = str_of(&params, "type", "knowledge");
+        let title = str_of(&params, "title", "").trim().to_string();
+        let content = str_of(&params, "content", "").trim().to_string();
+        let mode = str_of(&params, "mode", crate::memory::MEMORY_MODE_ON_DEMAND);
+        if title.is_empty() || content.is_empty() {
+            return Err(AgentError::tool("title 和 content 都不能为空"));
+        }
+        if title.chars().count() > 120 || content.chars().count() > 4000 {
+            return Err(AgentError::tool("记忆过长：标题 ≤120 字，内容 ≤4000 字"));
+        }
+        // 同标题视为更新，避免模型反复沉淀同一条事实造成重复。
+        if let Some(existing) = self.core.memory.find(&title).await {
+            if existing.title == title {
+                self.core
+                    .memory
+                    .update(&existing.id, Some(&title), Some(&content), Some(&mode))
+                    .await
+                    .map_err(|e| AgentError::tool(format!("更新记忆失败: {e}")))?;
+                self.core.emit(Event::MemoryUpdated);
+                return Ok(AgentToolResult::text(format!(
+                    "已更新已有记忆「{title}」（id: {}）。",
+                    existing.id
+                )));
+            }
+        }
+        let entry = self
+            .core
+            .memory
+            .add(&memory_type, &title, &content, &mode)
+            .await
+            .map_err(|e| AgentError::tool(format!("保存记忆失败: {e}")))?;
+        self.core.emit(Event::MemoryUpdated);
+        Ok(AgentToolResult::text(format!(
+            "已保存记忆「{}」（id: {}，投递方式: {}）。",
+            entry.title, entry.id, entry.mode
+        )))
+    }
+}
+
+// ============================================================
+// ViewImage —— 让模型读取本机图片文件
+// ============================================================
+
+pub struct ViewImage {
+    core: Arc<CoreState>,
+    schema: Tool,
+}
+
+impl ViewImage {
+    pub fn new(core: Arc<CoreState>) -> Self {
+        let schema = make_tool(
+            "ViewImage",
+            "读取本机图片文件并返回给模型查看（png/jpeg/webp/gif，≤10MB）。\
+传绝对路径（支持 ~ 开头）。仅当当前模型支持图片理解时可用。",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "图片文件绝对路径" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        );
+        Self { core, schema }
+    }
+}
+
+fn expand_home(path: &str) -> std::path::PathBuf {
+    let p = path.trim();
+    if let Some(rest) = p.strip_prefix("~/") {
+        crate::paths::home_dir().join(rest)
+    } else if p == "~" {
+        crate::paths::home_dir()
+    } else {
+        std::path::PathBuf::from(p)
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[async_trait]
+impl AgentTool for ViewImage {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "ViewImage"
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        params: Value,
+        signal: CancellationToken,
+        _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
+        if !self.core.config.lock().await.vision_effective() {
+            return Err(AgentError::tool(
+                "当前模型未启用图片理解（设置 → 模型 → 图片理解），无法查看图片。",
+            ));
+        }
+        if signal.is_cancelled() {
+            return Err(AgentError::Abort);
+        }
+        let raw = str_of(&params, "path", "");
+        if raw.trim().is_empty() {
+            return Err(AgentError::tool("缺少图片路径 path"));
+        }
+        let path = expand_home(&raw);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => {
+                return Err(AgentError::tool(format!(
+                    "不支持的图片格式 .{ext}（仅支持 png/jpeg/webp/gif）：{}",
+                    path.display()
+                )))
+            }
+        };
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| AgentError::tool(format!("读取图片失败：{}（{e}）", path.display())))?;
+        if !meta.is_file() {
+            return Err(AgentError::tool(format!("不是文件：{}", path.display())));
+        }
+        const MAX: u64 = 10 * 1024 * 1024;
+        if meta.len() > MAX {
+            return Err(AgentError::tool(format!(
+                "图片过大（{} MB，上限 10 MB）：{}",
+                meta.len() / 1024 / 1024,
+                path.display()
+            )));
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| AgentError::tool(format!("读取图片失败：{e}")))?;
+        let image = ImageContent {
+            kind: Default::default(),
+            data: base64_encode(&bytes),
+            mime_type: mime.to_string(),
+        };
+        Ok(AgentToolResult {
+            content: vec![
+                TextContentOrImage::text(format!(
+                    "图片：{}（{}，{} KB）",
+                    path.display(),
+                    mime,
+                    bytes.len() / 1024
+                )),
+                TextContentOrImage::Image(image),
+            ],
+            details: Value::Null,
+            usage: None,
+            added_tool_names: Vec::new(),
+            terminate: false,
+        })
+    }
 }

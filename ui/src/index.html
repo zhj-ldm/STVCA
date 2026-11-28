@@ -121,19 +121,25 @@
         <div id="chat-main">
           <div id="conn-banner" class="conn-banner" hidden>后端未连接 · 正在重连…</div>
           <div id="chat-scroll" class="chat-scroll"></div>
+          <div id="chat-drop-hint" class="chat-drop-hint" hidden>松开鼠标，把图片发给 AI</div>
           <details id="kws-log" class="kws-log" hidden>
             <summary>唤醒日志（排查唤醒问题）</summary>
             <div id="kws-log-body" class="kws-log-body"></div>
           </details>
           <div class="chat-dock-wrap">
-            <div class="composer">
+            <div class="composer" id="chat-composer">
+              <div id="chat-images" class="chat-images" hidden></div>
               <textarea id="chat-input" rows="1"
-                placeholder="输入指令，或说唤醒词「computer」后直接说话…"></textarea>
+                placeholder="输入指令，或说唤醒词「computer」后直接说话…（可拖拽/粘贴图片）"></textarea>
+              <input id="chat-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
               <div class="composer-bar">
                 <div class="composer-meta">
                   <div id="chat-model-select" class="dd dd-up chat-model-select" title="切换当前模型（所选配置写入设置并立即生效）"></div>
                 </div>
                 <div class="composer-actions">
+                  <button id="btn-attach" class="icon-btn" title="添加图片（也可拖拽或粘贴）" aria-label="添加图片">
+                    <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M10.8 5.2 6.1 9.9a2 2 0 0 0 2.8 2.8l4.4-4.4a3.3 3.3 0 0 0-4.7-4.7L4 8.3a4.7 4.7 0 0 0 6.6 6.6l3-3"/></svg>
+                  </button>
                   <span id="voice-wave" class="voice-wave" hidden aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
                   <button id="btn-mic" class="icon-btn mic-off" title="开启/关闭语音监听" aria-label="语音监听">
                     <svg class="ico-mic" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5.6" y="1.8" width="4.8" height="7" rx="2.4"/><path d="M3.4 7.5a4.6 4.6 0 0 0 9.2 0M8 12.2v2.2"/></svg>
@@ -176,12 +182,23 @@
             <option value="narrative">经历 (narrative)</option>
             <option value="workflow">方法 (workflow)</option>
           </select>
+          <label class="mem-mode-label">投递方式
+            <select id="memory-mode">
+              <option value="system">系统提示词直连（每轮都能看到）</option>
+              <option value="on_demand">按需加载（AI 需要时经 MemoryGuide 读取）</option>
+            </select>
+          </label>
           <input id="memory-title" placeholder="标题" required />
           <textarea id="memory-content" placeholder="内容" rows="4" required></textarea>
           <button type="submit" class="solid">保存</button>
+          <p class="form-hint">直连记忆条数受「设置 → 行为 → 记忆直连上限」限制（最新优先）；超出或设为按需的条目只给 AI 标题索引。</p>
         </form>
         <div class="card list-card">
-          <h3>记忆条目 (<span id="memory-count">0</span>)</h3>
+          <div class="mem-list-head">
+            <h3>记忆条目 (<span id="memory-count">0</span>)</h3>
+            <button id="btn-memory-preview" type="button" class="btn-mini">查看实际注入</button>
+          </div>
+          <div id="memory-inject-summary" class="mem-inject-summary">—</div>
           <div id="memory-list" class="scroll-list"></div>
         </div>
       </div>
@@ -335,8 +352,17 @@
                 <p class="form-hint">多个 API Key 会按 round-robin 分摊，各自遵守 RPM 限速；本地 Ollama 可留空 Key，关闭思考时自动使用 -nothink 变体。</p>
                 <label>AI 人设（身份 / 性格，可自由编辑）
                   <textarea name="main_system_prompt" rows="5"></textarea>
-                  <span class="form-hint">核心行为规则（语音播报格式、单 Agent、主动询问等）由 resources/prompts/system.md 系统提示词文件强制注入，人设叠加在规则之后，不影响系统规则。</span>
+                  <span class="form-hint">人设会随每轮请求注入系统提示词：位于核心行为规则之后、Skills 与长期记忆之前。留空则只用核心规则。修改保存后下一轮对话即生效，无需重启。</span>
                 </label>
+                <div class="persona-preview-row">
+                  <button type="button" id="btn-prompt-preview" class="btn-mini">预览完整系统提示词</button>
+                  <span class="form-hint">展开查看实际发给模型的全文（人设 + 规则 + 技能目录 + 记忆注入）。</span>
+                </div>
+                <div class="vision-box">
+                  <label class="checkline"><input name="image_input_enabled" type="checkbox" /> 启用图片输入（需要模型支持视觉）</label>
+                  <p class="form-hint" id="vision-status">图片能力：检测中…</p>
+                  <p class="form-hint">开启后可在对话输入框拖拽/粘贴图片直接发给 AI，AI 也能用 ViewImage 工具读取本机图片。每个模型配置可单独指定「自动 / 支持 / 不支持」；自动模式按模型名判断（如 gpt-4o、claude-3、gemini、qwen-vl）。</p>
+                </div>
               </fieldset>
             </div>
             <div class="settings-panel" data-spanel="voice">
@@ -445,6 +471,12 @@
                   </div>
                   <p class="form-hint">打开开关的工具在渐进式模式下默认直接提供给模型；关闭的工具仍可通过 ToolGuide 按需启用。仅对「渐进式」生效。</p>
                 </div>
+                <div class="field-row">
+                  <label>记忆直连上限（条）
+                    <input name="memory_inject_limit" type="number" min="0" max="200" step="1" />
+                  </label>
+                </div>
+                <p class="form-hint">设为「系统提示词直连」的记忆会按最新优先注入，最多 N 条；0 = 全部改为按需加载（AI 通过 MemoryGuide 工具读取）。修改后下一轮对话即生效。</p>
                 <div class="field-row">
                   <label>输出语言
                     <select name="output_language">

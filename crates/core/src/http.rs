@@ -1,12 +1,12 @@
 //! HTTP API（axum）：core 与 Electron UI / voice-serve 的通信入口。
 //! UI 与后端接口一一对应，新增接口需同步前端。
 
-use crate::agents::{handle_wakeword, rebuild_agents, run_main_turn};
+use crate::agents::{handle_wakeword, rebuild_agents, run_main_turn_with_images, ChatImageInput};
 use crate::events::Event;
 use crate::state::CoreState;
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::{
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     middleware::{self, Next},
     response::sse::{Event as SseEvent, KeepAlive, Sse},
     routing::{delete, get, post},
@@ -98,8 +98,10 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/mcp/servers/:name", delete(remove_mcp))
         .route("/api/mcp/servers/:name/test", post(test_mcp))
         .route("/api/memory", get(list_memory).post(add_memory))
-        .route("/api/memory/:id", delete(remove_memory).put(update_memory))
+        .route("/api/memory/context", get(memory_context))
         .route("/api/memory/clear", post(clear_memory))
+        .route("/api/memory/:id", delete(remove_memory).put(update_memory))
+        .route("/api/system-prompt/preview", get(system_prompt_preview))
         .route("/api/schedules", get(list_schedules).post(add_schedule))
         .route(
             "/api/schedules/:id",
@@ -127,6 +129,9 @@ pub fn router(core: SharedState) -> Router {
         .route("/api/admin/rebuild", post(admin_rebuild))
         .route("/api/system/open-mic-settings", post(open_mic_settings))
         .route("/api/system/reveal", post(reveal_path))
+        // 本地接口：放宽 JSON 体积上限，允许一次附带多张图片（前端已限制单张 8MB × 4）。
+        // 放在 CORS 内层：超限 413 也带 CORS 头，浏览器端能读到错误而不是网络错误。
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(middleware::from_fn(cors_layer))
         .with_state(core)
 }
@@ -258,19 +263,105 @@ struct ChatReq {
     text: String,
     #[serde(default)]
     session_id: Option<String>,
+    /// 随消息上传的图片（data URL 或纯 base64）
+    #[serde(default)]
+    images: Vec<ChatImageReq>,
+}
+
+#[derive(Deserialize)]
+struct ChatImageReq {
+    #[serde(default)]
+    data: String,
+    #[serde(default)]
+    mime_type: String,
+    #[serde(default)]
+    name: String,
+}
+
+const MAX_CHAT_IMAGES: usize = 4;
+const MAX_CHAT_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 校验并规范化图片输入：剥掉 data URL 前缀、限定格式/数量/大小。
+fn parse_chat_images(raw: Vec<ChatImageReq>) -> Result<Vec<ChatImageInput>, String> {
+    if raw.len() > MAX_CHAT_IMAGES {
+        return Err(format!("一次最多发送 {MAX_CHAT_IMAGES} 张图片"));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    for (i, img) in raw.into_iter().enumerate() {
+        let mut mime = img.mime_type.trim().to_ascii_lowercase();
+        let mut data = img.data.trim().to_string();
+        if let Some(rest) = data.strip_prefix("data:") {
+            if let Some((head, body)) = rest.split_once(',') {
+                if mime.is_empty() {
+                    mime = head.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+                }
+                data = body.to_string();
+            }
+        }
+        if !matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+            return Err(format!(
+                "第 {} 张图片格式不支持（{}），仅支持 png / jpeg / webp / gif",
+                i + 1,
+                if mime.is_empty() { "未知" } else { mime.as_str() }
+            ));
+        }
+        data.retain(|c| !c.is_ascii_whitespace());
+        if data.is_empty()
+            || !data
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+        {
+            return Err(format!("第 {} 张图片数据不是有效的 base64", i + 1));
+        }
+        let padding = if data.ends_with("==") { 2 } else if data.ends_with('=') { 1 } else { 0 };
+        let approx_bytes = data.len() / 4 * 3 - padding;
+        if approx_bytes > MAX_CHAT_IMAGE_BYTES {
+            return Err(format!(
+                "第 {} 张图片过大（{:.1} MB，单张上限 8 MB）",
+                i + 1,
+                approx_bytes as f64 / 1024.0 / 1024.0
+            ));
+        }
+        let name = if img.name.trim().is_empty() {
+            format!("image-{}.{}", i + 1, mime.rsplit('/').next().unwrap_or("png"))
+        } else {
+            img.name.trim().to_string()
+        };
+        out.push(ChatImageInput { data, mime_type: mime, name });
+    }
+    Ok(out)
 }
 
 async fn chat(State(core): State<SharedState>, Json(req): Json<ChatReq>) -> Json<Value> {
-    let text = req.text.trim().to_string();
-    if text.is_empty() {
+    let mut text = req.text.trim().to_string();
+    let images = match parse_chat_images(req.images) {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"ok": false, "error": e})),
+    };
+    if text.is_empty() && images.is_empty() {
         return Json(json!({"ok": false, "error": "空消息"}));
+    }
+    if !images.is_empty() {
+        let vision = {
+            let cfg = core.config.lock().await;
+            cfg.vision_effective()
+        };
+        if !vision {
+            return Json(json!({
+                "ok": false,
+                "error": "当前模型未开启图片理解。请在 设置 → 模型 → 「启用图片输入」并确认模型支持视觉（或手动设为支持）。"
+            }));
+        }
+    }
+    if text.is_empty() {
+        text = "（请看这张图片）".into();
     }
     if core.main_busy.load(Ordering::SeqCst) {
         return Json(json!({"ok": false, "error": "主 Agent 正在处理中，可语音说 stop 打断"}));
     }
     let core2 = core.clone();
     tokio::spawn(async move {
-        run_main_turn(core2, text, req.session_id, false).await;
+        run_main_turn_with_images(core2, text, images, req.session_id, false).await;
     });
     Json(json!({"ok": true}))
 }
@@ -716,6 +807,15 @@ async fn probe_models(Json(req): Json<ProbeModelsReq>) -> Json<Value> {
     Json(json!({"ok": true, "models": models, "url": url}))
 }
 
+fn config_json(cfg: &crate::config::Config) -> Value {
+    let mut v = serde_json::to_value(cfg).unwrap_or_default();
+    if let Value::Object(map) = &mut v {
+        map.insert("vision_effective".into(), json!(cfg.vision_effective()));
+        map.insert("effective_model".into(), json!(cfg.effective_model()));
+    }
+    v
+}
+
 async fn get_config(State(core): State<SharedState>) -> Json<Value> {
     // 以配置文件为唯一真相源：外部直接改动 config.json 后，
     // UI 刷新即可看到新值，避免内存缓存与文件不一致。
@@ -725,10 +825,10 @@ async fn get_config(State(core): State<SharedState>) -> Json<Value> {
         .ok()
         .and_then(|s| serde_json::from_str::<crate::config::Config>(&s).ok())
     {
-        Some(cfg) => Json(serde_json::to_value(&cfg).unwrap_or_default()),
+        Some(cfg) => Json(config_json(&cfg)),
         None => {
             let cfg = core.config.lock().await;
-            Json(serde_json::to_value(&*cfg).unwrap_or_default())
+            Json(config_json(&cfg))
         }
     }
 }
@@ -906,12 +1006,16 @@ struct AddMemoryReq {
     memory_type: String,
     title: String,
     content: String,
+    /// system = 直连系统提示词；on_demand = 仅索引，按需读取（缺省 system）
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 async fn add_memory(State(core): State<SharedState>, Json(req): Json<AddMemoryReq>) -> Json<Value> {
+    let mode = req.mode.as_deref().unwrap_or(crate::memory::MEMORY_MODE_SYSTEM);
     match core
         .memory
-        .add(&req.memory_type, &req.title, &req.content)
+        .add(&req.memory_type, &req.title, &req.content, mode)
         .await
     {
         Ok(e) => {
@@ -938,6 +1042,8 @@ struct UpdateMemoryReq {
     title: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 async fn update_memory(
@@ -947,7 +1053,12 @@ async fn update_memory(
 ) -> Json<Value> {
     match core
         .memory
-        .update(&id, req.title.as_deref(), req.content.as_deref())
+        .update(
+            &id,
+            req.title.as_deref(),
+            req.content.as_deref(),
+            req.mode.as_deref(),
+        )
         .await
     {
         Ok(true) => {
@@ -967,6 +1078,42 @@ async fn clear_memory(State(core): State<SharedState>) -> Json<Value> {
         }
         Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
     }
+}
+
+/// 实际记忆注入预览：与每轮系统提示词使用同一份数据与格式化函数。
+async fn memory_context(State(core): State<SharedState>) -> Json<Value> {
+    let limit = {
+        let cfg = core.config.lock().await;
+        cfg.memory_inject_limit as usize
+    };
+    let inj = core.memory.injection(limit).await;
+    let section = crate::agents::memory_section(&inj).unwrap_or_default();
+    Json(json!({
+        "system_count": inj.system_count,
+        "on_demand_count": inj.on_demand_count,
+        "system_chars": inj.system_chars,
+        "index_chars": inj.index_chars,
+        "total_count": inj.total_count,
+        "limit": inj.limit,
+        "text": section,
+    }))
+}
+
+/// 完整系统提示词预览（最终发给模型的内容，含人设、Skills、记忆与图片能力说明）。
+async fn system_prompt_preview(State(core): State<SharedState>) -> Json<Value> {
+    let cfg = core.config.lock().await.clone();
+    let skills_text = core.skills.usage_text().await;
+    let inj = core
+        .memory
+        .injection(cfg.memory_inject_limit as usize)
+        .await;
+    let text = crate::agents::compose_system_prompt(&cfg, &skills_text, &inj);
+    Json(json!({
+        "text": text,
+        "chars": text.chars().count(),
+        "model": cfg.effective_model(),
+        "vision": cfg.vision_effective(),
+    }))
 }
 
 // ---------- 定时任务 ----------

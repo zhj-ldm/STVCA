@@ -129,6 +129,59 @@ function closeModal(val) { if (window.__closeModal) window.__closeModal(val); }
 const confirmDialog = (message, opts = {}) => openModal({ title: opts.title || '请确认', message, danger: !!opts.danger, confirmText: opts.confirmText || (opts.danger ? '删除' : '确定') });
 const promptDialog = (opts) => openModal({ ...opts, input: { value: opts.value || '', placeholder: opts.placeholder || '' } });
 
+// 只读长文本预览（系统提示词 / 记忆注入），等宽字体、可滚动
+function showTextPreview(title, text) {
+  if (modalOpen) closeModal(false);
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  const box = document.createElement('div');
+  box.className = 'modal';
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-modal', 'true');
+  const h = document.createElement('div');
+  h.className = 'modal-title';
+  h.textContent = title || '预览';
+  const pre = document.createElement('pre');
+  pre.className = 'modal-pre';
+  pre.textContent = text || '（空）';
+  const acts = document.createElement('div');
+  acts.className = 'modal-actions';
+  const close = document.createElement('button');
+  close.type = 'button';
+  close.className = 'solid';
+  close.textContent = '关闭';
+  acts.appendChild(close);
+  box.appendChild(h);
+  box.appendChild(pre);
+  box.appendChild(acts);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+  modalOpen = true;
+  let closed = false;
+  const doClose = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', onKey, true);
+    overlay.remove();
+    modalOpen = false;
+  };
+  function onKey(e) {
+    if (e.key === 'Escape') {
+      e.stopPropagation();
+      e.preventDefault();
+      doClose();
+    }
+  }
+  document.addEventListener('keydown', onKey, true);
+  overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) doClose(); });
+  close.addEventListener('click', doClose);
+  window.__closeModal = doClose;
+  requestAnimationFrame(() => {
+    overlay.classList.add('is-open');
+    close.focus();
+  });
+}
+
 // 异步按钮 loading 态：执行期间禁用并换文案，结束后恢复
 async function withBusy(btn, busyText, fn) {
   if (!btn) return fn();
@@ -608,6 +661,7 @@ function switchView(view, activeEl) {
   const target = document.getElementById('view-' + view);
   if (target) target.classList.add('active');
   if (view === 'subagents') loadSubagents();
+  if (view === 'memory') loadMemory();
 }
 document.addEventListener('click', (e) => {
   const el = e.target.closest('.nav-item[data-view], .nav__link[data-view]');
@@ -727,6 +781,13 @@ function cacheTurnDone(sessionId, elapsedMs, finalText) {
   if (typeof finalText === 'string') s.text = finalText;
 }
 
+// 待发送图片：{ id, name, mime, dataUrl }
+// 只在内存里排队，发送后随消息一次性发给后端；不写入本地存储。
+let pendingImages = [];
+const MAX_PENDING_IMAGES = 4;
+const MAX_IMAGE_FILE_BYTES = 8 * 1024 * 1024;
+const IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+
 function setSendBtn(busy) {
   sendBusy = !!busy;
   const btn = $('#btn-send');
@@ -741,8 +802,8 @@ function setSendBtn(busy) {
   btn.classList.toggle('stopping', interruptPending && sendBusy);
   btn.title = sendBusy ? (interruptPending ? '正在停止…' : '暂停（打断 AI）') : '发送';
   btn.setAttribute('aria-label', btn.title);
-  // 主流 AI 交互：空闲且输入为空时禁用；忙碌时必须保持可点击（用于打断）
-  const empty = !$('#chat-input') || !$('#chat-input').value.trim();
+  // 主流 AI 交互：空闲且输入为空（且没有待发图片）时禁用；忙碌时必须保持可点击（用于打断）
+  const empty = !$('#chat-input') || (! $('#chat-input').value.trim() && !pendingImages.length);
   btn.disabled = !sendBusy && empty;
   btn.classList.toggle('empty', btn.disabled);
 }
@@ -1829,12 +1890,29 @@ chatScroll.addEventListener('scroll', () => {
   chatLastTop = top;
 }, { passive: true });
 
-function addUserBubble(text) {
+function addUserBubble(text, images = []) {
   const div = document.createElement('div');
   div.className = 'msg user';
   const inner = document.createElement('div');
   inner.className = 'bubble';
-  inner.textContent = text;
+  if (images.length) {
+    const wrap = document.createElement('div');
+    wrap.className = 'bubble-imgs';
+    images.forEach((im) => {
+      const img = document.createElement('img');
+      img.src = im.dataUrl;
+      img.alt = im.name || '图片';
+      img.title = im.name || '';
+      wrap.appendChild(img);
+    });
+    inner.appendChild(wrap);
+  }
+  if (text) {
+    const tx = document.createElement('div');
+    tx.className = 'bubble-text';
+    tx.textContent = text;
+    inner.appendChild(tx);
+  }
   div.appendChild(inner);
   attachUserMenu(div, '');
   chatScroll.appendChild(div);
@@ -2567,13 +2645,14 @@ function createMsg(text, mid) {
   return attachUserMenu(div, mid);
 }
 
-function sendText(text) {
+function sendText(text, images = []) {
   text = (text || '').trim();
-  if (!text) return;
+  if (!text && images.length) text = '（请看这张图片）';
+  if (!text && !images.length) return;
   finishTurn();
   // 乐观渲染：立即显示用户气泡 + “正在处理…”占位，不等待 SSE 事件
   // （避免 SSE 迟到/丢失时界面“没反应”）；SSE user_text 到达时按文本去重。
-  addUserBubble(text);
+  addUserBubble(text, images);
   lastTurnUserText = text;
   beginTurnUI();
   pendingLocalQueue.push(text);
@@ -2596,7 +2675,11 @@ function sendText(text) {
       toast(msg, 'error');
     }
   };
-  apiPost('/api/chat', { text, session_id: sentSession })
+  const body = { text, session_id: sentSession };
+  if (images.length) {
+    body.images = images.map((im) => ({ data: im.dataUrl, mime_type: im.mime, name: im.name }));
+  }
+  apiPost('/api/chat', body)
     .then((j) => {
       if (j && j.ok === false) {
         // 后端拒绝：本轮未真正占用任务，立即复位按钮（轮询会按 main_status 兜底纠正）
@@ -2633,6 +2716,158 @@ function interruptAI() {
     });
 }
 
+// ---------------- 聊天图片（拖拽 / 粘贴 / 选择） ----------------
+function visionAvailable() {
+  return !!(window.visionInfo && window.visionInfo.enabled);
+}
+
+function renderChatImages() {
+  const box = $('#chat-images');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!pendingImages.length) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  pendingImages.forEach((im) => {
+    const chip = document.createElement('div');
+    chip.className = 'chat-img-chip';
+    const img = document.createElement('img');
+    img.src = im.dataUrl;
+    img.alt = im.name;
+    const del = document.createElement('button');
+    del.type = 'button';
+    del.className = 'img-del';
+    del.textContent = '×';
+    del.title = '移除这张图片';
+    del.addEventListener('click', () => {
+      pendingImages = pendingImages.filter((p) => p.id !== im.id);
+      renderChatImages();
+      setSendBtn(sendBusy);
+    });
+    const name = document.createElement('span');
+    name.className = 'img-name';
+    name.textContent = im.name;
+    chip.appendChild(img);
+    chip.appendChild(del);
+    chip.appendChild(name);
+    box.appendChild(chip);
+  });
+}
+
+function readImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('读取图片失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addImageFiles(fileList) {
+  const files = Array.from(fileList || []).filter((f) => f && f.type && f.type.startsWith('image/'));
+  if (!files.length) return;
+  if (!visionAvailable()) {
+    toast('当前模型未开启图片理解：设置 → 模型 → 勾选「启用图片输入」并确认模型支持视觉', 'warn');
+    return;
+  }
+  for (const f of files) {
+    if (pendingImages.length >= MAX_PENDING_IMAGES) {
+      toast(`一次最多发送 ${MAX_PENDING_IMAGES} 张图片`, 'warn');
+      break;
+    }
+    if (!IMAGE_MIMES.includes(f.type)) {
+      toast(`不支持 ${f.type || '该'} 格式（仅 png / jpeg / webp / gif）`, 'warn');
+      continue;
+    }
+    if (f.size > MAX_IMAGE_FILE_BYTES) {
+      toast(`图片「${f.name}」超过 8 MB，无法发送`, 'warn');
+      continue;
+    }
+    try {
+      const dataUrl = await readImageFile(f);
+      pendingImages.push({
+        id: 'img-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+        name: f.name || 'image',
+        mime: f.type,
+        dataUrl,
+      });
+    } catch (e) {
+      toast(e.message || '读取图片失败', 'error');
+    }
+  }
+  renderChatImages();
+  setSendBtn(sendBusy);
+}
+
+function takePendingImages() {
+  const imgs = pendingImages.slice();
+  pendingImages = [];
+  renderChatImages();
+  return imgs;
+}
+
+$('#btn-attach').addEventListener('click', () => {
+  if (!visionAvailable()) {
+    toast('当前模型未开启图片理解：设置 → 模型 → 勾选「启用图片输入」并确认模型支持视觉', 'warn');
+    return;
+  }
+  $('#chat-file').click();
+});
+$('#chat-file').addEventListener('change', (e) => {
+  addImageFiles(e.target.files);
+  e.target.value = '';
+});
+// 粘贴图片：输入框里 Ctrl/⌘+V 直接附带
+$('#chat-input').addEventListener('paste', (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  const files = [];
+  for (const it of items) {
+    if (it.kind === 'file' && it.type.startsWith('image/')) {
+      const f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (files.length) {
+    e.preventDefault();
+    addImageFiles(files);
+  }
+});
+// 拖拽图片到对话区（用计数器避免子元素 dragleave 抖动）
+let dragDepth = 0;
+const chatMain = $('#chat-main');
+const dropHint = $('#chat-drop-hint');
+chatMain.addEventListener('dragenter', (e) => {
+  if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+  e.preventDefault();
+  dragDepth += 1;
+  chatMain.classList.add('drag-over');
+  if (dropHint) dropHint.hidden = false;
+});
+chatMain.addEventListener('dragover', (e) => {
+  if (e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+});
+chatMain.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) {
+    chatMain.classList.remove('drag-over');
+    if (dropHint) dropHint.hidden = true;
+  }
+});
+chatMain.addEventListener('drop', (e) => {
+  dragDepth = 0;
+  chatMain.classList.remove('drag-over');
+  if (dropHint) dropHint.hidden = true;
+  if (!e.dataTransfer || !e.dataTransfer.files || !e.dataTransfer.files.length) return;
+  e.preventDefault();
+  addImageFiles(e.dataTransfer.files);
+});
+
 $('#btn-send').addEventListener('click', () => {
   if (sendBusy) {
     interruptAI();
@@ -2641,7 +2876,7 @@ $('#btn-send').addEventListener('click', () => {
   const v = $('#chat-input').value;
   $('#chat-input').value = '';
   setSendBtn(false);
-  sendText(v);
+  sendText(v, takePendingImages());
 });
 let busyEnterHintAt = 0;
 $('#chat-input').addEventListener('keydown', (e) => {
@@ -2659,7 +2894,7 @@ $('#chat-input').addEventListener('keydown', (e) => {
     const v = $('#chat-input').value;
     $('#chat-input').value = '';
     setSendBtn(false);
-    sendText(v);
+    sendText(v, takePendingImages());
   }
 });
 $('#chat-input').addEventListener('input', () => setSendBtn(sendBusy));
@@ -3136,11 +3371,33 @@ async function pollVoiceLevel() {
 }
 
 // ---------------- 记忆 ----------------
+function memoryModeLabel(mode) {
+  return mode === 'on_demand' ? '按需加载' : '直连提示词';
+}
+
+// 实际注入预览（后端与每轮系统提示词共用同一份数据）
+async function loadMemoryInjection() {
+  const box = $('#memory-inject-summary');
+  if (!box) return null;
+  try {
+    const j = await apiGet('/api/memory/context');
+    window.__memoryInject = j;
+    box.textContent = j.total_count
+      ? `系统提示词直连 ${j.system_count} 条（约 ${j.system_chars} 字，上限 ${j.limit} 条） · 按需加载 ${j.on_demand_count} 条 — 下一轮对话即按此注入`
+      : '当前没有记忆条目。新增或让 AI 保存后会显示注入情况。';
+    return j;
+  } catch (e) {
+    box.textContent = '注入状态读取失败：' + e.message;
+    return null;
+  }
+}
+
 async function loadMemory() {
   // 编辑保护：用户正在改某条记忆时不重建列表（避免输入到一半被 SSE 刷新冲掉）
   if (document.querySelector('#memory-list .mem-edit-title')) return;
   const box = $('#memory-list');
   if (box && !box.querySelector('.list-item')) renderListLoading(box);
+  loadMemoryInjection();
   try {
     const list = await apiGet('/api/memory');
     $('#memory-count').textContent = list.length;
@@ -3155,7 +3412,10 @@ async function loadMemory() {
       const view = () => {
         item.innerHTML = `
           <div class="row">
-            <span class="tag">${esc(m.memory_type)}</span>
+            <span class="row" style="gap:6px">
+              <span class="tag">${esc(m.memory_type)}</span>
+              <span class="tag mem-mode-tag ${m.mode === 'on_demand' ? 'on_demand' : 'system'}">${memoryModeLabel(m.mode)}</span>
+            </span>
             <span class="meta">${esc(m.created_at)}</span>
           </div>
           <div class="title">${esc(m.title)}</div>
@@ -3176,16 +3436,24 @@ async function loadMemory() {
         });
       };
       const edit = () => {
+        const mode = m.mode === 'on_demand' ? 'on_demand' : 'system';
         item.innerHTML = `
           <div class="row"><span class="tag">${esc(m.memory_type)}</span></div>
           <input class="mem-edit-title" placeholder="标题" value="${esc(m.title)}" />
           <textarea class="mem-edit-content" rows="4" placeholder="内容">${esc(m.content)}</textarea>
+          <label class="mem-mode-label">投递方式
+            <select class="mem-edit-mode">
+              <option value="system"${mode === 'system' ? ' selected' : ''}>系统提示词直连</option>
+              <option value="on_demand"${mode === 'on_demand' ? ' selected' : ''}>按需加载（MemoryGuide）</option>
+            </select>
+          </label>
           <div class="row"><div></div><div class="acts">
             <button data-cancel>取消</button>
             <button data-save class="solid">保存</button>
           </div></div>`;
         const titleEl = item.querySelector('.mem-edit-title');
         const contentEl = item.querySelector('.mem-edit-content');
+        const modeEl = item.querySelector('.mem-edit-mode');
         item.querySelector('[data-cancel]').addEventListener('click', view);
         item.querySelector('[data-save]').addEventListener('click', async (ev) => {
           const t = titleEl.value.trim();
@@ -3193,10 +3461,11 @@ async function loadMemory() {
           if (!t || !c) { toast('标题和内容都不能为空', 'warn'); return; }
           await withBusy(ev.currentTarget, '保存中…', async () => {
             try {
-              const j = await apiPut('/api/memory/' + encodeURIComponent(m.id), { title: t, content: c });
+              const j = await apiPut('/api/memory/' + encodeURIComponent(m.id), { title: t, content: c, mode: modeEl.value });
               if (j && j.ok === false) throw new Error(j.error || '后端未确认');
-              m.title = t; m.content = c;
+              m.title = t; m.content = c; m.mode = modeEl.value;
               view();
+              loadMemoryInjection();
               toast('记忆已更新', 'success');
             } catch (e) { toast('保存失败: ' + e.message, 'error'); }
           });
@@ -3215,6 +3484,7 @@ $('#memory-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const body = {
     type: $('#memory-type').value,
+    mode: $('#memory-mode').value,
     title: $('#memory-title').value.trim(),
     content: $('#memory-content').value.trim(),
   };
@@ -3226,6 +3496,20 @@ $('#memory-form').addEventListener('submit', async (e) => {
       $('#memory-title').value = ''; $('#memory-content').value = '';
       toast('记忆已保存', 'success');
     } catch (err) { toast('保存失败: ' + err.message, 'error'); }
+  });
+});
+
+$('#btn-memory-preview').addEventListener('click', async () => {
+  await withBusy($('#btn-memory-preview'), '加载中…', async () => {
+    try {
+      const j = await apiGet('/api/memory/context');
+      const head = j.total_count
+        ? `直连 ${j.system_count} 条（约 ${j.system_chars} 字，上限 ${j.limit} 条） · 按需 ${j.on_demand_count} 条`
+        : '当前没有记忆条目';
+      showTextPreview('实际记忆注入（与真实请求一致）', head + '\n\n' + (j.text || '（无）'));
+    } catch (e) {
+      toast('读取注入预览失败: ' + e.message, 'error');
+    }
   });
 });
 
@@ -3864,6 +4148,16 @@ function modelEditHTML(m, ordinal) {
     '<div class="me-models-panel" hidden></div>' +
     '<span class="me-probe-error" hidden></span>' +
     '</div>' +
+    '<div class="me-field me-vision-field">' +
+    '<label class="me-field-label">图片理解' +
+    '<select class="me-vision">' +
+    '<option value="auto">自动判断（按模型名）</option>' +
+    '<option value="on">支持（强制启用）</option>' +
+    '<option value="off">不支持（强制关闭）</option>' +
+    '</select>' +
+    '</label>' +
+    '<p class="me-format-hint">自动模式识别常见视觉模型（gpt-4o、claude-3/4、gemini、qwen-vl、llava 等）；中转/本地模型判断不准时手动指定。</p>' +
+    '</div>' +
     '<div class="me-field me-rpm-field">' +
     '<label class="me-field-label">每个 Key 限额 RPM <input class="me-rpm" type="number" min="1" step="1" placeholder="20" /></label>' +
     '</div>'
@@ -3958,6 +4252,10 @@ function renderModelEdit() {
   box.querySelector('.me-url').value = m.base_url || '';
   box.querySelector('.me-model').value = m.model || '';
   box.querySelector('.me-rpm').value = m.rpm_limit ?? '';
+  const visionSel = box.querySelector('.me-vision');
+  if (visionSel) {
+    visionSel.value = m.supports_vision === true ? 'on' : m.supports_vision === false ? 'off' : 'auto';
+  }
   if (!box._keyWired) { wireKeyList(box); box._keyWired = true; }
   wireBaseUrlBox(box);
   wireProviderDropdown(box, m);
@@ -4201,6 +4499,10 @@ function flushModelEdit() {
     }
   }
   cur.rpm_limit = edit.querySelector('.me-rpm').value ? parseInt(edit.querySelector('.me-rpm').value, 10) : null;
+  const visionSel = edit.querySelector('.me-vision');
+  if (visionSel) {
+    cur.supports_vision = visionSel.value === 'on' ? true : visionSel.value === 'off' ? false : null;
+  }
   const keys = Array.from(edit.querySelectorAll('.p-key')).map((el) => el.value.trim()).filter(Boolean);
   cur.api_keys = keys;
   cur.api_key = keys[0] || '';
@@ -4240,6 +4542,7 @@ async function saveModels() {
     cfg.sub_model = (rows[1] || {}).model || '';
     const r = await apiPost('/api/config', cfg);
     if (r && r.ok === false) throw new Error(r.error || '保存失败');
+    refreshVisionInfo();
     return true;
   } catch (e) {
     toast('模型切换保存失败: ' + e.message, 'error');
@@ -4250,6 +4553,34 @@ async function saveModels() {
 // 配置是否已成功加载过一次：未加载完成前禁止提交设置，
 // 避免冷启动竞态下用表单默认值（如未勾选的「启用语音」）覆盖磁盘配置。
 let configLoaded = false;
+
+function updateVisionStatus() {
+  const el = $('#vision-status');
+  if (!el) return;
+  const info = window.visionInfo;
+  if (!info) { el.textContent = '图片能力：检测中…'; return; }
+  const model = info.model || '当前模型';
+  if (info.enabled) {
+    el.textContent = `图片能力：已启用（${model}）——可拖拽/粘贴图片，AI 也可用 ViewImage 读图。`;
+    el.style.color = 'var(--ok)';
+  } else {
+    el.textContent = `图片能力：未启用（${model} 未被识别为视觉模型）。可在上方该模型配置的「图片理解」里手动设为「支持」。`;
+    el.style.color = 'var(--text-2)';
+  }
+}
+
+// 模型/配置变更后刷新图片能力（后端按当前 active provider + 名称启发式计算）
+async function refreshVisionInfo() {
+  try {
+    const c = await apiGet('/api/config');
+    window.visionInfo = {
+      enabled: !!c.vision_effective,
+      model: c.effective_model || c.main_model || '',
+    };
+    updateVisionStatus();
+  } catch (_) { /* 后端未就绪时保持上次状态 */ }
+}
+
 async function loadConfig(retry = 0) {
   const editBox = $('#model-edit');
   if (editBox && !editBox.querySelector('.me-name')) {
@@ -4295,6 +4626,13 @@ async function loadConfig(retry = 0) {
     form.context_feeding_enabled.checked = !!cfg.context_feeding_enabled;
     form.context_recent_count.value = cfg.context_recent_count ?? 10;
     form.context_compress_count.value = cfg.context_compress_count ?? 30;
+    form.memory_inject_limit.value = cfg.memory_inject_limit ?? 30;
+    form.image_input_enabled.checked = cfg.image_input_enabled !== false;
+    window.visionInfo = {
+      enabled: !!cfg.vision_effective,
+      model: cfg.effective_model || cfg.main_model || '',
+    };
+    updateVisionStatus();
     form.output_language.value = cfg.output_language || 'zh';
     form.show_kws_log.checked = getKwsLogEnabled();
     const themeSel = $('#ui-theme');
@@ -4409,6 +4747,20 @@ async function switchActiveModel(idx, modelId) {
 // 页面样式主题切换（本地 UI 偏好，立即生效，不入后端配置）
 $('#ui-theme').addEventListener('change', (e) => applyUiTheme(e.target.value));
 
+// 完整系统提示词预览（人设 + 规则 + Skills + 记忆，实际发送内容）
+$('#btn-prompt-preview').addEventListener('click', async () => {
+  const btn = $('#btn-prompt-preview');
+  await withBusy(btn, '加载中…', async () => {
+    try {
+      const j = await apiGet('/api/system-prompt/preview');
+      const meta = `模型：${j.model || '—'} · 图片：${j.vision ? '已启用' : '未启用'} · 全文 ${j.chars} 字\n\n`;
+      showTextPreview('完整系统提示词（下一轮实际发送）', meta + (j.text || ''));
+    } catch (e) {
+      toast('读取系统提示词失败: ' + e.message, 'error');
+    }
+  });
+});
+
 $('#btn-model-new').addEventListener('click', () => {
   flushModelEdit();
   const ord = modelList.length + 1;
@@ -4498,6 +4850,11 @@ $('#settings-form').addEventListener('submit', async (e) => {
     context_feeding_enabled: f.context_feeding_enabled.checked,
     context_recent_count: parseInt(f.context_recent_count.value, 10) || 10,
     context_compress_count: Math.max(0, parseInt(f.context_compress_count.value, 10) || 0),
+    memory_inject_limit: (() => {
+      const n = parseInt(f.memory_inject_limit.value, 10);
+      return Number.isFinite(n) ? Math.min(200, Math.max(0, n)) : 30;
+    })(),
+    image_input_enabled: f.image_input_enabled.checked,
     default_loaded_tools: Array.from(
       document.querySelectorAll('#tool-load-list input[type="checkbox"]:checked')
     ).map((c) => c.value),
@@ -4526,6 +4883,7 @@ $('#settings-form').addEventListener('submit', async (e) => {
       if (r && r.ok === false) throw new Error(r.error || '后端未确认');
       flashSaved();
       renderModelSelector();
+      refreshVisionInfo();
       toast('设置已保存，Agent 已重建', 'success');
     } catch (err) { toast('保存失败: ' + err.message, 'error'); }
   });

@@ -407,7 +407,7 @@ body.is-resizing { cursor: col-resize; }
 /* ---------------- 对话 ---------------- */
 #view-chat { padding: 0; overflow-x: hidden; }
 #chat-layout { display: flex; height: 100%; min-height: 0; }
-#chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; max-width: 100%; }
+#chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; max-width: 100%; position: relative; }
 
 /* 后端未连接横幅 */
 .conn-banner {
@@ -1775,3 +1775,67 @@ body.theme-lcars .me-url-preview__label { color: #99c; }
 body.theme-lcars .me-url-preview__url { color: #fc9; background: #101018; }
 body.theme-lcars .me-url-error { color: #f99; }
 body.theme-lcars #main__container input.is-invalid { border-color: #c66 !important; }
+
+/* ===== 聊天图片（拖拽 / 粘贴 / 上传） ===== */
+.chat-images {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 2px 2px 10px;
+}
+.chat-img-chip {
+  position: relative; width: 72px; height: 72px;
+  border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--border); background: var(--bg-3);
+}
+.chat-img-chip img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.chat-img-chip .img-del {
+  position: absolute; top: 3px; right: 3px;
+  width: 18px; height: 18px; border-radius: 50%;
+  border: none; cursor: pointer;
+  background: rgba(0,0,0,.62); color: #fff;
+  font-size: 12px; line-height: 18px; text-align: center; padding: 0;
+}
+.chat-img-chip .img-del:hover { background: rgba(0,0,0,.82); }
+.chat-img-chip .img-name {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 2px 6px; font-size: 10px; color: #fff;
+  background: linear-gradient(transparent, rgba(0,0,0,.55));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-drop-hint {
+  position: absolute; inset: 12px;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px dashed var(--blue); border-radius: var(--r-xl);
+  background: rgba(59,130,246,.06); color: var(--blue);
+  font-size: 14px; font-weight: 600; z-index: 20; pointer-events: none;
+}
+#chat-main.drag-over { position: relative; }
+.bubble-imgs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+.bubble-imgs img {
+  max-width: 180px; max-height: 180px; border-radius: 10px;
+  display: block; object-fit: cover;
+}
+.msg.user .bubble .bubble-text { white-space: pre-wrap; }
+
+/* ===== 记忆投递方式 ===== */
+.mem-mode-label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--text-2); }
+.mem-list-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.mem-list-head h3 { margin: 0; }
+.mem-inject-summary {
+  margin-top: 6px; padding: 8px 10px; border-radius: 10px;
+  background: var(--bg-3); color: var(--text-2);
+  font-size: 12px; line-height: 1.6;
+}
+.mem-mode-tag.system { color: var(--ok); border-color: rgba(22,138,72,.4); background: rgba(22,138,72,.06); }
+.mem-mode-tag.on_demand { color: var(--blue); border-color: rgba(59,130,246,.4); background: rgba(59,130,246,.06); }
+
+/* ===== 设置：人设预览 / 图片能力 ===== */
+.persona-preview-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.vision-box { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.modal-pre {
+  margin-top: 10px; max-height: 60vh; overflow: auto;
+  padding: 12px 14px; border-radius: 10px;
+  background: var(--bg-3); border: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px; line-height: 1.65; color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+}

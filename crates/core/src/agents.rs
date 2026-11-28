@@ -3,15 +3,16 @@
 
 use crate::config::Config;
 use crate::events::Event;
+use crate::memory::MemoryInjection;
 use crate::search::WebSearchTool;
 use crate::sessions::ToolCallRecord;
 use crate::state::CoreState;
 use crate::tools::{auto_announce, AskUserTool, DeliverFiles, ToolGuide, ToolHub};
 use rpi_agent::AgentTool;
 use rpi_ai::types::{
-    Api, AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, Message,
-    StopReason, ThinkingLevel, ToolCall, ToolResultMessage, ToolResultRole, Usage,
-    UserMessage,
+    Api, AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, ImageContent,
+    InputModality, Message, StopReason, ThinkingLevel, ToolCall, ToolResultMessage,
+    ToolResultRole, Usage, UserContent, UserMessage,
 };
 use rpi_ai::{Model, Provider, SimpleStreamOptions};
 use rpi_ai::model::{
@@ -35,7 +36,6 @@ pub struct MainAgent {
     model: Model,
     /// 思考强度（None = 关闭）
     reasoning: Option<ThinkingLevel>,
-    system_prompt: String,
     max_turns: usize,
     hub: Arc<ToolHub>,
     ask_user: bool,
@@ -69,8 +69,51 @@ impl Channel {
     }
 }
 
+/// 一条随用户消息上传的图片（已校验过的 base64）。
+#[derive(Debug, Clone)]
+pub struct ChatImageInput {
+    pub data: String,
+    pub mime_type: String,
+    pub name: String,
+}
+
+impl ChatImageInput {
+    fn to_content(&self) -> Content {
+        Content::Image(ImageContent {
+            kind: Default::default(),
+            data: self.data.clone(),
+            mime_type: self.mime_type.clone(),
+        })
+    }
+}
+
 fn user_msg(text: &str) -> Message {
     Message::User(UserMessage::new(text.to_string(), 0))
+}
+
+/// 带图片的用户消息：有图时用 Content::Blocks（text + image），
+/// OpenAI 兼容端点会序列化成 image_url data URL；无图保持纯字符串。
+fn user_msg_with_images(text: &str, images: &[ChatImageInput]) -> Message {
+    if images.is_empty() {
+        return user_msg(text);
+    }
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    if !text.trim().is_empty() {
+        blocks.push(Content::text(text));
+    }
+    for img in images {
+        blocks.push(img.to_content());
+    }
+    Message::User(UserMessage::new(UserContent::Blocks(blocks), 0))
+}
+
+/// 历史回放里给图片轮次留的纯文本痕迹（图片本身不入库，避免会话文件膨胀）。
+fn image_history_text(text: &str, images: &[ChatImageInput]) -> String {
+    if images.is_empty() {
+        return text.to_string();
+    }
+    let names: Vec<&str> = images.iter().map(|i| i.name.as_str()).collect();
+    format!("{text}\n\n［本轮附带图片 {} 张：{}（图片仅当轮可用）］", images.len(), names.join("、"))
 }
 
 fn assistant_msg(text: &str, model: &str) -> Message {
@@ -92,12 +135,12 @@ fn assistant_msg(text: &str, model: &str) -> Message {
     }))
 }
 
-fn tool_result_msg(call: &ToolCall, text: &str, is_error: bool) -> Message {
+fn tool_result_msg(call: &ToolCall, content: Vec<Content>, is_error: bool) -> Message {
     Message::ToolResult(Box::new(ToolResultMessage {
         role: ToolResultRole,
         tool_call_id: call.id.clone(),
         tool_name: call.name.clone(),
-        content: vec![Content::text(text)],
+        content,
         details: None,
         usage: None,
         added_tool_names: Vec::new(),
@@ -161,6 +204,12 @@ async fn build_turn_tools(
         hub.core().clone(),
         sid.to_string(),
     )));
+    // 记忆工具：按需读取 / 主动沉淀；图片查看（模型支持视觉时才有意义）。
+    tools.push(Arc::new(crate::tools::MemoryGuide::new(hub.core().clone())));
+    tools.push(Arc::new(crate::tools::SaveMemory::new(hub.core().clone())));
+    if hub.core().config.lock().await.vision_effective() {
+        tools.push(Arc::new(crate::tools::ViewImage::new(hub.core().clone())));
+    }
     if eager {
         tools.extend(hub.all_tools());
     } else {
@@ -462,6 +511,11 @@ pub(crate) async fn build_llm_parts(
     // 部分中转端会按很小的默认值截断，长思考或写大文件时会出现
     // 「思考完、工具调用被截断、正文为空」的假完成。
     model.max_tokens = 8192;
+    // 图片输入：全局开关 + 当前模型（手动指定或按名称自动判断）允许时才声明 Image 模态。
+    // 声明后 provider 才会把工具返回的图片转成 image_url；用户消息里的图片块本身不受限。
+    if cfg.vision_effective() && !model.input.contains(&InputModality::Image) {
+        model.input.push(InputModality::Image);
+    }
 
     let mut channels = Vec::new();
     for key in keys {
@@ -513,12 +567,9 @@ pub(crate) async fn build_llm_parts(
 /// 构建主 Agent 运行时：把配置解析成一个模型 + 多条 Key 通道（round-robin / 独立 RPM）。
 async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
     let (channels, model, reasoning) = build_llm_parts(&core).await?;
-    let (system_prompt, ask_user, eager_tools, max_turns) = {
+    let (ask_user, eager_tools, max_turns) = {
         let cfg = core.config.lock().await;
-        let skills_text = core.skills.usage_text().await;
-        let memory_text = core.memory.context_text(30).await;
         (
-            compose_system_prompt(&cfg, &skills_text, &memory_text),
             cfg.ask_user_enabled,
             cfg.tool_loading == "eager",
             cfg.max_turns.clamp(1, 100) as usize,
@@ -531,12 +582,22 @@ async fn build_main_agent(core: Arc<CoreState>) -> Result<MainAgent, String> {
         cursor: AtomicUsize::new(0),
         model,
         reasoning,
-        system_prompt,
         max_turns,
         hub,
         ask_user,
         eager_tools,
     })
+}
+
+/// 每轮重新组装系统提示词（记忆/技能/人设改动无需重建 Agent 即可在下一轮生效）。
+pub async fn build_main_system_prompt(core: &Arc<CoreState>) -> String {
+    let cfg = core.config.lock().await.clone();
+    let skills_text = core.skills.usage_text().await;
+    let inj = core
+        .memory
+        .injection(cfg.memory_inject_limit as usize)
+        .await;
+    compose_system_prompt(&cfg, &skills_text, &inj)
 }
 
 /// 确保唯一 Agent 已构建（API 配置就绪）
@@ -592,6 +653,17 @@ async fn wait_for_interrupt(core: &Arc<CoreState>, gen: u64) {
 pub async fn run_main_turn(
     core: Arc<CoreState>,
     user_text: String,
+    session_id: Option<String>,
+    is_report: bool,
+) {
+    run_main_turn_with_images(core, user_text, Vec::new(), session_id, is_report).await;
+}
+
+/// 带图片的用户轮：images 已由 HTTP 层校验（base64 + mime）。
+pub async fn run_main_turn_with_images(
+    core: Arc<CoreState>,
+    user_text: String,
+    images: Vec<ChatImageInput>,
     session_id: Option<String>,
     is_report: bool,
 ) {
@@ -726,7 +798,8 @@ pub async fn run_main_turn(
     // 子 Agent 汇报不入用户历史，避免污染会话（避免切换会话后把汇报当作用户指令重放）。
     if !is_report {
         let mut sessions = core.sessions.lock().await;
-        sessions.append(&sid, "user", &user_text, Vec::new(), 0);
+        let stored = image_history_text(&user_text, &images);
+        sessions.append(&sid, "user", &stored, Vec::new(), 0);
     }
 
     // 播放“已发送”提示音（原版语义：把用户输入发给 AI 时播放 complete.mp3）。
@@ -769,7 +842,14 @@ pub async fn run_main_turn(
 
     // 历史恢复不含当前输入（上面先取快照、再持久化 user），此处追加当前 user。
     let mut messages = history;
-    messages.push(user_msg(&user_text));
+    messages.push(user_msg_with_images(&user_text, &images));
+    // 系统提示词每轮重新组装：记忆/人设/技能改动无需重建 Agent，下一轮立即生效。
+    let system_prompt = build_main_system_prompt(&core).await;
+    // 当前模型能否接收图片（决定工具返回的图片是否保留给上游）
+    let vision = {
+        let cfg = core.config.lock().await;
+        cfg.vision_effective()
+    };
 
     let mut cancel = CancellationToken::new();
     let mut final_text = String::new();
@@ -794,7 +874,7 @@ pub async fn run_main_turn(
         }
         let tools = build_turn_tools(&agent.hub, &sid, agent.ask_user, agent.eager_tools).await;
         let ctx = Context {
-            system_prompt: Some(agent.system_prompt.clone()),
+            system_prompt: Some(system_prompt.clone()),
             messages: messages.clone(),
             tools: tools.iter().map(|t| t.schema().clone()).collect(),
         };
@@ -1070,7 +1150,7 @@ pub async fn run_main_turn(
                 .iter()
                 .find(|t| t.schema().name == call.name)
                 .cloned();
-            let (result_text, ok) = match tool {
+            let (result_content, result_text, ok) = match tool {
                 Some(t) => {
                     // 工具执行（bash/curl/读大文件等）可能很久，
                     // 必须与中断信号竞速，点停止立刻返回，不再等工具跑完。
@@ -1084,29 +1164,48 @@ pub async fn run_main_turn(
                         Arc::new(|_| {}),
                     );
                     tokio::pin!(exec);
+                    let to_msg = |r: rpi_agent::types::AgentToolResult| {
+                        let text = tool_result_text(&r);
+                        (tool_result_content(r, vision), text)
+                    };
                     tokio::select! {
                         _ = wait_for_interrupt(&core, my_gen) => {
                             interrupted = true;
                             cancel.cancel();
                             match tokio::time::timeout(Duration::from_secs(3), &mut exec).await {
-                                Ok(Ok(r)) => (tool_result_text(&r), true),
-                                Ok(Err(e)) => (format!("工具执行失败: {e}"), false),
-                                Err(_) => ("已中断".to_string(), false),
+                                Ok(Ok(r)) => {
+                                    let (c, t) = to_msg(r);
+                                    (c, t, true)
+                                }
+                                Ok(Err(e)) => {
+                                    let m = format!("工具执行失败: {e}");
+                                    (vec![Content::text(m.clone())], m, false)
+                                }
+                                Err(_) => {
+                                    let m = "已中断".to_string();
+                                    (vec![Content::text(m.clone())], m, false)
+                                }
                             }
                         }
                         r = &mut exec => match r {
-                            Ok(r) => (tool_result_text(&r), true),
-                            Err(e) => (format!("工具执行失败: {e}"), false),
+                            Ok(r) => {
+                                let (c, t) = to_msg(r);
+                                (c, t, true)
+                            }
+                            Err(e) => {
+                                let m = format!("工具执行失败: {e}");
+                                (vec![Content::text(m.clone())], m, false)
+                            }
                         },
                     }
                 }
-                None => (
-                    format!(
+                None => {
+                    let m = format!(
                         "工具 {} 当前不可用：渐进式加载下请先调用 ToolGuide 请求该工具。",
                         call.name
-                    ),
-                    false,
-                ),
+                    );
+                    (vec![Content::text(m.clone())], m, false)
+                }
             };
             let summary: String = result_text.chars().take(300).collect();
             core.emit(Event::ToolResult {
@@ -1126,7 +1225,7 @@ pub async fn run_main_turn(
                 rec.summary = summary;
                 rec.done = true;
             }
-            messages.push(tool_result_msg(&call, &result_text, !ok));
+            messages.push(tool_result_msg(&call, result_content, !ok));
             if interrupted {
                 break;
             }
@@ -1244,6 +1343,18 @@ fn tool_result_text(r: &rpi_agent::types::AgentToolResult) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 工具结果 → 消息内容：保留图片（模型支持视觉时），否则退回纯文本。
+fn tool_result_content(r: rpi_agent::types::AgentToolResult, vision: bool) -> Vec<Content> {
+    let mut out = r.into_content();
+    if !vision {
+        out.retain(|c| !matches!(c, Content::Image(_)));
+    }
+    if out.is_empty() {
+        out.push(Content::text("（工具没有返回内容）"));
+    }
+    out
 }
 
 // ============================================================
@@ -1525,9 +1636,9 @@ fn strip_section(md: &str, heading: &str) -> String {
 }
 
 /// 统一组装系统提示词（唯一入口，顺序固定）：
-/// 输出语言 → 核心行为规则 → 个人设定 → 可用 Skills → 长期记忆。
+/// 输出语言 → 核心行为规则 → 子 Agent → 个人设定 → 图片能力 → Skills → 长期记忆。
 /// 空段自动跳过，避免反复追加产生重复规则或"（暂无…）"噪音。
-pub fn compose_system_prompt(cfg: &Config, skills_text: &str, memory_text: &str) -> String {
+pub fn compose_system_prompt(cfg: &Config, skills_text: &str, mem: &MemoryInjection) -> String {
     let mut rules = load_system_rules();
     if !cfg.ask_user_enabled {
         // 关闭中途询问时移除该节，避免模型调用未注册工具；其余规则保持不变
@@ -1547,24 +1658,26 @@ pub fn compose_system_prompt(cfg: &Config, skills_text: &str, memory_text: &str)
 - 子 Agent 完成会自动以独立卡片通知用户并语音播报，你无需长篇复述其结果。"
             .to_string(),
     );
-    let persona = cfg.main_system_prompt.trim();
-    if !persona.is_empty() {
-        parts.push(format!("=== 个人设定（用户配置的人设） ===\n{persona}"));
+    push_persona(system_persona(cfg), &mut parts);
+    if cfg.vision_effective() {
+        parts.push(
+            "=== 图片理解 ===\n\
+- 用户发来的消息可能附带图片（拖拽/粘贴上传），你可以直接理解图片内容。\n\
+- 需要查看本机图片文件时，调用 ViewImage 工具并传入绝对路径，图片会随工具结果返回给你。\n\
+- 看不到图片内容时不要臆测画面细节，直接说明图片不可读。"
+                .to_string(),
+        );
     }
-    let skills = skills_text.trim();
-    if !skills.is_empty() && !skills.starts_with("（暂无") {
-        parts.push(format!("=== 可用 Skills ===\n{skills}"));
-    }
-    let memory = memory_text.trim();
-    if !memory.is_empty() && !memory.starts_with("（暂无") {
-        parts.push(format!("=== 长期记忆 ===\n{memory}"));
+    push_skills(skills_text, &mut parts);
+    if let Some(section) = memory_section(mem) {
+        parts.push(section);
     }
     parts.join("\n\n")
 }
 
 /// 子 Agent 系统提示词：与主 Agent 共用语言指令、核心规则、人设、Skills 目录与长期记忆，
 /// 只把「派发子 Agent」一节替换为后台执行规则（无用户在场、无语音/交付/子 Agent 工具）。
-pub fn compose_child_system_prompt(cfg: &Config, skills_text: &str, memory_text: &str) -> String {
+pub fn compose_child_system_prompt(cfg: &Config, skills_text: &str, mem: &MemoryInjection) -> String {
     // 子 Agent 没有 AskUser / 语音播报 / DeliverFiles 能力：去掉对应章节，
     // 避免模型按"必须"规则调用未注册的工具或输出无意义的播报段。
     let mut rules = load_system_rules();
@@ -1589,19 +1702,66 @@ pub fn compose_child_system_prompt(cfg: &Config, skills_text: &str, memory_text:
 - 如果任务无法完成，直接说明原因和已尝试的步骤，不要编造结果。"
             .to_string(),
     );
-    let persona = cfg.main_system_prompt.trim();
+    push_persona(system_persona(cfg), &mut parts);
+    if cfg.vision_effective() {
+        parts.push(
+            "=== 图片理解 ===\n- 需要查看本机图片时调用 ViewImage 传入绝对路径，图片会随工具结果返回。"
+                .to_string(),
+        );
+    }
+    push_skills(skills_text, &mut parts);
+    if let Some(section) = memory_section(mem) {
+        parts.push(section);
+    }
+    parts.join("\n\n")
+}
+
+fn system_persona(cfg: &Config) -> &str {
+    cfg.main_system_prompt.trim()
+}
+
+fn push_persona(persona: &str, parts: &mut Vec<String>) {
     if !persona.is_empty() {
         parts.push(format!("=== 个人设定（用户配置的人设） ===\n{persona}"));
     }
+}
+
+fn push_skills(skills_text: &str, parts: &mut Vec<String>) {
     let skills = skills_text.trim();
     if !skills.is_empty() && !skills.starts_with("（暂无") {
         parts.push(format!("=== 可用 Skills ===\n{skills}"));
     }
-    let memory = memory_text.trim();
-    if !memory.is_empty() && !memory.starts_with("（暂无") {
-        parts.push(format!("=== 长期记忆 ===\n{memory}"));
+}
+
+/// 「长期记忆」章节：直连记忆全文 + 按需记忆索引。预览接口也复用它，
+/// 保证界面展示与实际发送给模型的内容一字不差。
+pub fn memory_section(mem: &MemoryInjection) -> Option<String> {
+    let mut block = String::new();
+    let system = mem.system_text.trim();
+    if !system.is_empty() {
+        block.push_str(system);
     }
-    parts.join("\n\n")
+    let index = mem.on_demand_index.trim();
+    if !index.is_empty() {
+        if !block.is_empty() {
+            block.push_str("\n\n");
+        }
+        block.push_str(
+            "以下记忆按需加载（未直接展开）。需要时调用 MemoryGuide 工具（action=\"read\" 传 id，\
+或 action=\"search\" 传关键词）查看具体内容；不要凭空猜测未展开的记忆：\n",
+        );
+        block.push_str(index);
+    }
+    if block.is_empty() {
+        return None;
+    }
+    let mut section = format!("=== 长期记忆 ===\n{block}");
+    if !mem.on_demand_index.trim().is_empty() || !mem.system_text.trim().is_empty() {
+        section.push_str(
+            "\n\n（用户明确要求记住某件事时，可调用 SaveMemory 保存；默认按需加载，避免系统提示词膨胀。）",
+        );
+    }
+    Some(section)
 }
 
 /// 输出语言强制指令：拼接在系统提示词最前，声明最高优先级，

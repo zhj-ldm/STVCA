@@ -71,6 +71,33 @@ pub fn default_context_compress() -> u32 {
     30
 }
 
+/// serde 默认值：直接注入系统提示词的记忆条数上限
+pub fn default_memory_inject_limit() -> u32 {
+    30
+}
+
+/// 按模型名粗判是否支持图片输入（无法识别的模型按不支持处理，
+/// 用户可在设置里对每个 provider 强制开启/关闭）。
+pub fn model_likely_vision(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    const HINTS: &[&str] = &[
+        "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "gpt-5", "chatgpt-4o",
+        "o1", "o3", "o4",
+        "claude-3", "claude-4", "claude-sonnet", "claude-opus",
+        "gemini",
+        "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl", "qwen2.5vl", "qwen3vl", "qwen-omni",
+        "llava", "minicpm-v", "internvl", "pixtral",
+        "glm-4v", "glm-4.1v", "glm-4.5v",
+        "llama-3.2-vision", "llama-4",
+        "mistral-small-3", "mistral-medium-3",
+        "gemma-3", "gemma3",
+        "doubao-vision", "doubao-1.5-vision", "step-1v", "yi-vision",
+        "grok-2-vision", "grok-4",
+        "kimi-latest-vision", "moonshot-v1-8k-vision",
+    ];
+    HINTS.iter().any(|h| m.contains(h))
+}
+
 /// 单条 API 上游配置（多 API key / 多 base_url 分摊 RPM 压力）。
 /// 每个上游持有独立 RPM 限流器，各自遵守自己的每分钟配额。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +122,9 @@ pub struct ProviderEntry {
     /// 该上游探测到并启用的模型列表（对话界面可在其中切换）；空 = 仅用 model 字段
     #[serde(default)]
     pub models: Vec<String>,
+    /// 图片理解能力：None = 按模型名自动判断，Some(true/false) = 用户强制指定
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
 }
 
 impl Default for ProviderEntry {
@@ -107,6 +137,7 @@ impl Default for ProviderEntry {
             rpm_limit: None,
             api_keys: Vec::new(),
             models: Vec::new(),
+            supports_vision: None,
         }
     }
 }
@@ -256,6 +287,12 @@ pub struct Config {
     /// 用户在「设置 → 工具加载」里逐个开关控制；为空 = 全部按需加载。
     #[serde(default)]
     pub default_loaded_tools: Vec<String>,
+    /// 直接注入系统提示词的记忆条数上限（按最新优先；0 = 全部走按需加载）
+    #[serde(default = "default_memory_inject_limit")]
+    pub memory_inject_limit: u32,
+    /// 全局图片输入总开关（关闭后即使模型支持视觉也不发送图片）
+    #[serde(default = "default_true")]
+    pub image_input_enabled: bool,
 
     // ---- 多 API 上游（单 Agent 轮询分摊 RPM）----
     /// 多个上游（多 key/多 base_url/多模型）。非空时优先使用本列表构建 Agent，
@@ -321,6 +358,8 @@ impl Default for Config {
             context_recent_count: default_context_recent(),
             context_compress_count: default_context_compress(),
             default_loaded_tools: Vec::new(),
+            memory_inject_limit: default_memory_inject_limit(),
+            image_input_enabled: true,
             providers: Vec::new(),
             active_model: String::new(),
         }
@@ -331,6 +370,38 @@ impl Config {
     pub fn voice_base(&self) -> String {
         // voice-serve 固定绑定 127.0.0.1（本地回环），无需可配置 host
         format!("http://127.0.0.1:{}", self.voice_port)
+    }
+
+    /// 当前生效的上游配置（providers 为空时返回 None，走旧字段）
+    pub fn active_provider(&self) -> Option<&ProviderEntry> {
+        if self.providers.is_empty() {
+            return None;
+        }
+        self.providers
+            .iter()
+            .find(|p| !self.active_model.is_empty() && p.name == self.active_model)
+            .or_else(|| self.providers.first())
+    }
+
+    /// 当前模型名（含旧字段回退）
+    pub fn effective_model(&self) -> String {
+        match self.active_provider() {
+            Some(p) if !p.model.trim().is_empty() => p.model.trim().to_string(),
+            _ => self.main_model.trim().to_string(),
+        }
+    }
+
+    /// 本轮是否真的能发送图片：全局开关 + 手动指定/模型名自动判断。
+    pub fn vision_effective(&self) -> bool {
+        if !self.image_input_enabled {
+            return false;
+        }
+        if let Some(p) = self.active_provider() {
+            if let Some(manual) = p.supports_vision {
+                return manual;
+            }
+        }
+        model_likely_vision(&self.effective_model())
     }
 
     /// 生效 TTS 音色：输出语言为 en 且当前音色是中文音色时，改用 voice_en，避免中文音色念英文。

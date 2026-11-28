@@ -480,10 +480,13 @@ async fn run_task_loop(
     // 与主 Agent 对齐：同一份语言指令 / 核心规则 / 人设 / Skills 目录 / 长期记忆，
     // 外加后台执行规则（子 Agent 版本）。
     let system_prompt = {
-        let cfg = core.config.lock().await;
+        let cfg = core.config.lock().await.clone();
         let skills_text = core.skills.usage_text().await;
-        let memory_text = core.memory.context_text(30).await;
-        crate::agents::compose_child_system_prompt(&cfg, &skills_text, &memory_text)
+        let mem = core
+            .memory
+            .injection(cfg.memory_inject_limit as usize)
+            .await;
+        crate::agents::compose_child_system_prompt(&cfg, &skills_text, &mem)
     };
     // 工具全量默认加载：基础工作工具 + 技能/MCP 能力 + 已连接 MCP 服务的全部工具。
     let tools = {
