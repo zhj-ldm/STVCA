@@ -292,6 +292,8 @@ impl ToolHub {
             Arc::new(CurlTool),
             Arc::new(ImportSkill::new(core.clone())),
             Arc::new(ConnectMcp::new(core.clone())),
+            // 主动沉淀记忆：经 ToolGuide 渐进加载，避免常驻提示词/工具列表膨胀
+            Arc::new(SaveMemory::new(core.clone())),
         ];
         Arc::new(Self {
             core,

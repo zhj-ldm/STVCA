@@ -204,9 +204,9 @@ async fn build_turn_tools(
         hub.core().clone(),
         sid.to_string(),
     )));
-    // 记忆工具：按需读取 / 主动沉淀；图片查看（模型支持视觉时才有意义）。
+    // 记忆读取常驻；记忆写入（SaveMemory）是懒加载工具，渐进式下经 ToolGuide 启用，
+    // 全量模式下由 hub.all_tools() 一并提供。图片查看（模型支持视觉时才有意义）。
     tools.push(Arc::new(crate::tools::MemoryGuide::new(hub.core().clone())));
-    tools.push(Arc::new(crate::tools::SaveMemory::new(hub.core().clone())));
     if hub.core().config.lock().await.vision_effective() {
         tools.push(Arc::new(crate::tools::ViewImage::new(hub.core().clone())));
     }
@@ -1758,7 +1758,8 @@ pub fn memory_section(mem: &MemoryInjection) -> Option<String> {
     let mut section = format!("=== 长期记忆 ===\n{block}");
     if !mem.on_demand_index.trim().is_empty() || !mem.system_text.trim().is_empty() {
         section.push_str(
-            "\n\n（用户明确要求记住某件事时，可调用 SaveMemory 保存；默认按需加载，避免系统提示词膨胀。）",
+            "\n\n（用户明确要求记住某件事时，可调用 SaveMemory 保存；默认按需加载，避免系统提示词膨胀。\
+若当前工具列表里没有 SaveMemory，先调用 ToolGuide 请求它，下一次请求即可直接调用。）",
         );
     }
     Some(section)
